@@ -1,0 +1,14 @@
+# database
+db/*
+
+# python chache
+__pycache__
+
+# junk scipts
+sh/*
+
+# env
+.env
+
+# logs
+log

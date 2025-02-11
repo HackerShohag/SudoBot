@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Bot Service
+After=network.target
+
+[Service]
+ExecStartPre=/bin/sleep 60
+ExecStart=/usr/bin/python3 $BOT_PATH/main.py >> $BOT_PATH/log/bot_log.txt >> /dev/null 2>&1
+Restart=always
+# RestartSec=10   # Add a 10-second delay before restarting
+User=$USER
+WorkingDirectory=$BOT_PATH
+StandardOutput=append:$BOT_PATH/log/bot_log.log
+StandardError=append:$BOT_PATH/log/bot_log_err.log
+
+[Install]
+WantedBy=multi-user.target
+
