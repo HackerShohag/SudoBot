@@ -13,11 +13,12 @@ async def main():
         ConversationHandler(
             entry_points=[
                 CommandHandler('run', run_command),
-                CommandHandler("run", menu.run),
-                CommandHandler("getLocalIP", menu.get_local_ip),
-                CommandHandler("getPublicIP", menu.get_public_ip),
-                CommandHandler("getSystemInfo", menu.get_system_info),
-                CommandHandler("getDiskUsage", menu.get_disk_usage)
+                # CommandHandler("run", menu.run),
+                CommandHandler("get_local_ip", menu.get_local_ip),
+                CommandHandler("get_public_ip", menu.get_public_ip),
+                CommandHandler("get_system_info", menu.get_system_info),
+                CommandHandler("get_system_usage", menu.get_system_usage),
+                CommandHandler("get_disk_usage", menu.get_disk_usage)
             ],
             states={AWAITING_SUDO_PASSWORD: [MessageHandler(
                 filters.TEXT & ~filters.COMMAND, password_input)]},
@@ -27,7 +28,7 @@ async def main():
 
     application.add_handler(CallbackQueryHandler(handle_command_from_keyboard))
     # application.add_handler(CommandHandler("getlocalip", menu.get_local_ip))
-    # application.add_handler(CommandHandler("getpublicip", menu.get_public_ip))
+    # application.add_handler(CommandHandler("get_public_ip", menu.get_public_ip))
     # application.add_handler(CommandHandler(
     #     "getsysteminfo", menu.get_system_info))
     # application.add_handler(CommandHandler(

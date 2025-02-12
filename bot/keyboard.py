@@ -25,7 +25,7 @@ def generate_keyboard():
     cursor.execute('''
     SELECT command FROM command_history
     ORDER BY frequency DESC
-    LIMIT 4
+    LIMIT 6
     ''')
     frequent_commands = [row[0] for row in cursor.fetchall()]
     

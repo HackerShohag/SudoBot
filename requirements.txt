@@ -2,3 +2,4 @@ telegram==0.0.1
 python-telegram-bot==20.8
 python-dotenv==1.0.1
 asyncio==3.4.3
+gputil==1.4.0
