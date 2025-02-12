@@ -4,7 +4,7 @@ from bot.config import BOT_TOKEN
 from bot.bot import run_command, password_input, AWAITING_SUDO_PASSWORD
 from bot.keyboard import handle_command_from_keyboard
 from bot import menu
-
+from bot.utils import authorize_user, remove_user
 
 async def main():
     application = Application.builder().token(BOT_TOKEN).build()
@@ -13,7 +13,6 @@ async def main():
         ConversationHandler(
             entry_points=[
                 CommandHandler('run', run_command),
-                # CommandHandler("run", menu.run),
                 CommandHandler("get_local_ip", menu.get_local_ip),
                 CommandHandler("get_public_ip", menu.get_public_ip),
                 CommandHandler("get_system_info", menu.get_system_info),
@@ -27,12 +26,8 @@ async def main():
     )
 
     application.add_handler(CallbackQueryHandler(handle_command_from_keyboard))
-    # application.add_handler(CommandHandler("getlocalip", menu.get_local_ip))
-    # application.add_handler(CommandHandler("get_public_ip", menu.get_public_ip))
-    # application.add_handler(CommandHandler(
-    #     "getsysteminfo", menu.get_system_info))
-    # application.add_handler(CommandHandler(
-    #     "getdiskusage", menu.get_disk_usage))
+    application.add_handler(CommandHandler("authorize", authorize_user))
+    application.add_handler(CommandHandler("remove", remove_user))
 
     await application.initialize()
     print("Bot is running...")

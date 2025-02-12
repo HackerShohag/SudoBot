@@ -85,7 +85,7 @@ BOT_TOKEN=your_telegram_bot_token
 
 ### 📌 Start the Bot
 ```bash
-python main.py
+python3 main.py
 ```
 
 ### 📌 Run in the Background (for servers)
@@ -104,12 +104,12 @@ pkill -f main.py
 
 #### 📌 Run All Tests
 ```bash
-python -m unittest discover tests
+python3 -m unittest discover tests
 ```
 
 #### 📌 Run Specific Test File
 ```bash
-python -m unittest tests.test_menu
+python3 -m unittest tests.test_menu
 ```
 
 ---

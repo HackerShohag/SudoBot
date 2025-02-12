@@ -7,6 +7,8 @@ import shutil
 import psutil
 import GPUtil
 
+from bot.utils import is_user_authorized
+
 async def set_bot_menu(application):
     commands = [
         BotCommand("run", "Run a command"),
@@ -18,10 +20,11 @@ async def set_bot_menu(application):
     ]
     await application.bot.set_my_commands(commands)
 
-async def run(update: Update, context) -> None:
-    await update.message.reply_text('Please complete the run command by providing arguments.')
-
 async def get_local_ip(update: Update, context) -> None:
+    if not is_user_authorized(update.message.from_user.id):
+        await update.message.reply_text("❌ You are not authorized to run commands.")
+        return
+
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
@@ -31,6 +34,10 @@ async def get_local_ip(update: Update, context) -> None:
         await update.message.reply_text(f'Error retrieving local IP: {str(e)}')
 
 async def get_system_info(update: Update, context) -> None:
+    if not is_user_authorized(update.message.from_user.id):
+        await update.message.reply_text("❌ You are not authorized to run commands.")
+        return
+    
     try:
         system_info = platform.uname()
         response = (
@@ -46,6 +53,10 @@ async def get_system_info(update: Update, context) -> None:
         await update.message.reply_text(f'Error retrieving system info: {str(e)}')
 
 async def get_disk_usage(update: Update, context) -> None:
+    if not is_user_authorized(update.message.from_user.id):
+        await update.message.reply_text("❌ You are not authorized to run commands.")
+        return
+    
     try:
         total, used, free = shutil.disk_usage("/")
         response = (
@@ -58,6 +69,10 @@ async def get_disk_usage(update: Update, context) -> None:
         await update.message.reply_text(f'Error retrieving disk usage: {str(e)}')
 
 async def get_public_ip(update: Update, context) -> None:
+    if not is_user_authorized(update.message.from_user.id):
+        await update.message.reply_text("❌ You are not authorized to run commands.")
+        return
+    
     try:
         response = requests.get('https://api.ipify.org?format=json')
         public_ip = response.json().get('ip')
@@ -66,6 +81,10 @@ async def get_public_ip(update: Update, context) -> None:
         await update.message.reply_text(f'Error retrieving public IP: {str(e)}')
 
 async def get_system_usage(update: Update, context) -> None:
+    if not is_user_authorized(update.message.from_user.id):
+        await update.message.reply_text("❌ You are not authorized to run commands.")
+        return
+    
     try:
         # Get CPU usage and count
         cpu_usage = psutil.cpu_percent(interval=1)

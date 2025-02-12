@@ -1,8 +1,8 @@
-# bot_menu.py
 import asyncio
 from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
 from bot.keyboard import update_command_history, update_keyboard
+from bot.utils import is_user_authorized
 from bot.config import MAX_CHARS
 
 AWAITING_SUDO_PASSWORD = 1
@@ -84,12 +84,19 @@ async def send_large_output(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         )
 
 async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+
+    if not is_user_authorized(user_id):
+        await update.message.reply_text("❌ You are not authorized to run commands.")
+        return
+
     command = ' '.join(context.args)
-    
+
     if not command:
+        # TODO: autofill the input field with the /run command so the user can just type the command
         await update.message.reply_text("Please provide a command to run.", reply_to_message_id=update.message.message_id)
         return
-    
+
     if command.startswith("sudo"):
         message = await update.message.reply_text("Enter your sudo password:", reply_to_message_id=update.message.message_id)
         context.user_data['command'] = command
