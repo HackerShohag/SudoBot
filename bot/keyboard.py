@@ -5,25 +5,29 @@ import sqlite3
 conn = sqlite3.connect('db/commands_history.db')
 cursor = conn.cursor()
 
-# Create the table to store command frequencies if it doesn't exist
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS command_history (
-    command TEXT PRIMARY KEY,
-    frequency INTEGER
-)
-''')
-conn.commit()
+# Function to create a user-specific table if it doesn't exist
+def create_user_table(user_id):
+    cursor.execute(f'''
+    CREATE TABLE IF NOT EXISTS command_history_{user_id} (
+        command TEXT PRIMARY KEY,
+        frequency INTEGER
+    )
+    ''')
+    conn.commit()
 
-# Track the last run command
-last_run_command = ""
+# Track the last run command for each user
+last_run_command = {}
 
-# Function to generate the inline keyboard with frequent and last commands
-def generate_keyboard():
+# Function to generate the inline keyboard with frequent and last commands for a user
+def generate_keyboard(user_id):
     global last_run_command
 
-    # Get the most frequent commands from the database
-    cursor.execute('''
-    SELECT command FROM command_history
+    # Create the user-specific table if it doesn't exist
+    create_user_table(user_id)
+
+    # Get the most frequent commands from the user's table
+    cursor.execute(f'''
+    SELECT command FROM command_history_{user_id}
     ORDER BY frequency DESC
     LIMIT 6
     ''')
@@ -38,17 +42,18 @@ def generate_keyboard():
         buttons.append(row)
 
     # Add the last run command as well
-    if last_run_command:
-        buttons.append([InlineKeyboardButton(f"{last_run_command}", callback_data=last_run_command)])
+    if user_id in last_run_command and last_run_command[user_id]:
+        buttons.append([InlineKeyboardButton(f"{last_run_command[user_id]}", callback_data=last_run_command[user_id])])
 
     # Return the keyboard layout
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
 
 async def update_keyboard(update, context):
-    # Generate the updated keyboard (you can use your existing `generate_keyboard()` function)
-    new_keyboard = generate_keyboard()
+    user_id = update.message.from_user.id
+    # Generate the updated keyboard for the user
+    new_keyboard = generate_keyboard(user_id)
 
-    await context.bot.send_message(
+    message = await context.bot.send_message(
         chat_id=update.message.chat_id,
         text="Frequently used commands:",
         reply_markup=new_keyboard
@@ -67,17 +72,21 @@ async def handle_command_from_keyboard(update, context, execute_command_callback
 
 def update_command_history(update, context):
     global last_run_command
+    user_id = update.message.from_user.id
     command = update.message.text  # Get the text of the user's message
+
+    # Create the user-specific table if it doesn't exist
+    create_user_table(user_id)
 
     # Filter commands that start with '/'
     if command.startswith('/'):
-        # Update the frequency in the database
-        cursor.execute('''
-        INSERT INTO command_history (command, frequency)
+        # Update the frequency in the user's table
+        cursor.execute(f'''
+        INSERT INTO command_history_{user_id} (command, frequency)
         VALUES (?, 1)
         ON CONFLICT(command) DO UPDATE SET frequency = frequency + 1
         ''', (command,))
         conn.commit()
 
-        # Update the last run command
-        last_run_command = command
+        # Update the last run command for the user
+        last_run_command[user_id] = command
