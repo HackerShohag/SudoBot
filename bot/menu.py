@@ -1,3 +1,4 @@
+import re
 import socket
 import requests
 from telegram import Update
@@ -6,6 +7,7 @@ import platform
 import shutil
 import psutil
 import GPUtil
+import subprocess
 
 from bot.utils import is_user_authorized
 
@@ -15,6 +17,7 @@ async def set_bot_menu(application):
         BotCommand("get_local_ip", "Get your local IP address"),
         BotCommand("get_public_ip", "Get your public IP address"),
         BotCommand("get_system_info", "Get system information"),
+        BotCommand("get_machine_specs", "Get machine specifications"),
         BotCommand("get_system_usage", "Get system usage"),
         BotCommand("get_disk_usage", "Get disk usage")
     ]
@@ -123,3 +126,88 @@ async def get_system_usage(update: Update, context) -> None:
         await update.message.reply_text(response)
     except Exception as e:
         await update.message.reply_text(f'Error retrieving system usage: {str(e)}')
+
+async def get_machine_specs(update: Update, context) -> None:
+    if not is_user_authorized(update.message.from_user.id):
+        await update.message.reply_text("❌ You are not authorized to run commands.")
+        return
+
+    try:
+        cpu_info = platform.processor()
+        cpu_count = psutil.cpu_count(logical=True)
+
+        # Get detailed CPU information
+        cpu_name = None
+        cpu_speed = None
+        cpu_vendor = None
+
+        if platform.system() == "Windows":
+            cpu_name = cpu_info
+        else:
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if "model name" in line:
+                        cpu_name = line.split(":")[1].strip()
+                    elif "cpu MHz" in line:
+                        cpu_speed = line.split(":")[1].strip()
+                    elif "vendor_id" in line:
+                        cpu_vendor = line.split(":")[1].strip()
+
+        # Get detailed RAM information
+        ram_info = []
+        if platform.system() == "Windows":
+            result = subprocess.run(["wmic", "MemoryChip", "get", "Manufacturer,Speed,Capacity"], capture_output=True, text=True)
+            ram_info.append(result.stdout.strip())
+        else:
+            ram_details = get_ram_info()
+            formatted_ram_info = "\n".join(
+                [f"{index + 1}. {ram['Manufacturer']} {ram['Size']} {ram['Type']} {ram['Form Factor']} ({ram['Speed']})" for index, ram in enumerate(ram_details)]
+            )
+            ram_info.append(formatted_ram_info)
+
+        # Get GPU details
+        gpus = GPUtil.getGPUs()
+        gpu_name = gpus[0].name if gpus else 'N/A'
+        gpu_memory = gpus[0].memoryTotal if gpus else 'N/A'
+        gpu_vendor = gpus[0].driver if gpus else 'N/A'
+
+        response = (
+            f"CPU: {cpu_name} ({cpu_info})\n"
+            f"CPU Cores: {cpu_count}\n"
+            f"CPU Speed: {cpu_speed} MHz\n"
+            f"CPU Vendor: {cpu_vendor}\n"
+            f"RAM Info:\n{ram_info[0]}\n"
+            f"GPU: {gpu_name}\n"
+            f"GPU Memory: {gpu_memory} MiB\n"
+            f"GPU Vendor: {gpu_vendor}\n"
+        )
+        await update.message.reply_text(response)
+    except Exception as e:
+        await update.message.reply_text(f'Error retrieving machine specs: {str(e)}')
+
+# Helper function to get detailed RAM information on Linux
+def get_ram_info():
+    try:
+        result = subprocess.run(["sudo", "dmidecode", "--type", "17"], capture_output=True, text=True)
+        output = result.stdout
+
+        ram_info = []
+        for ram_block in output.split("\n\n"):
+            manufacturer = re.search(r"Manufacturer:\s+(.+)", ram_block)
+            speed = re.search(r"Speed:\s+(.+)", ram_block)
+            ram_type = re.search(r"Type:\s+(.+)", ram_block)
+            form_factor = re.search(r"Form Factor:\s+(.+)", ram_block)
+            size = re.search(r"Size:\s+(.+)", ram_block)
+
+            if size and "No Module Installed" not in size.group(1):  # Ignore empty slots
+                ram_info.append({
+                    "Manufacturer": manufacturer.group(1) if manufacturer else "Unknown",
+                    "Speed": speed.group(1) if speed else "Unknown",
+                    "Type": ram_type.group(1) if ram_type else "Unknown",
+                    "Form Factor": form_factor.group(1) if form_factor else "Unknown",
+                    "Size": size.group(1)
+                })
+
+        return ram_info
+    except Exception as e:
+        return [f"Error retrieving RAM info: {str(e)}"]

@@ -16,6 +16,7 @@ async def main():
                 CommandHandler("get_local_ip", menu.get_local_ip),
                 CommandHandler("get_public_ip", menu.get_public_ip),
                 CommandHandler("get_system_info", menu.get_system_info),
+                CommandHandler("get_machine_specs", menu.get_machine_specs),
                 CommandHandler("get_system_usage", menu.get_system_usage),
                 CommandHandler("get_disk_usage", menu.get_disk_usage)
             ],
