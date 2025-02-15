@@ -167,9 +167,15 @@ async def get_machine_specs(update: Update, context) -> None:
 
         # Get GPU details
         gpus = GPUtil.getGPUs()
-        gpu_name = gpus[0].name if gpus else 'N/A'
-        gpu_memory = gpus[0].memoryTotal if gpus else 'N/A'
-        gpu_vendor = gpus[0].driver if gpus else 'N/A'
+        if gpus:
+            gpu_info = []
+            for index, gpu in enumerate(gpus):
+                gpu_info.append(
+                    f"{index + 1}. {gpu.name} ({gpu.memoryTotal} MiB), Vendor: {gpu.driver}"
+                )
+            gpu_details = "\n".join(gpu_info)
+        else:
+            gpu_details = 'N/A'
 
         response = (
             f"CPU: {cpu_name} ({cpu_info})\n"
@@ -177,9 +183,7 @@ async def get_machine_specs(update: Update, context) -> None:
             f"CPU Speed: {cpu_speed} MHz\n"
             f"CPU Vendor: {cpu_vendor}\n"
             f"RAM Info:\n{ram_info[0]}\n"
-            f"GPU: {gpu_name}\n"
-            f"GPU Memory: {gpu_memory} MiB\n"
-            f"GPU Vendor: {gpu_vendor}\n"
+            f"GPU Info:\n{gpu_details}\n"
         )
         await update.message.reply_text(response)
     except Exception as e:
