@@ -1,8 +1,8 @@
 import re
 import socket
 import requests
-from telegram import Update
-from telegram import BotCommand
+from telegram import Update, BotCommand
+from telegram.ext import ContextTypes
 import platform
 import shutil
 import psutil
@@ -10,6 +10,7 @@ import GPUtil
 import subprocess
 
 from bot.utils import is_user_authorized
+import asyncio
 
 async def set_bot_menu(application):
     commands = [
@@ -19,7 +20,8 @@ async def set_bot_menu(application):
         BotCommand("get_system_info", "Get system information"),
         BotCommand("get_machine_specs", "Get machine specifications"),
         BotCommand("get_system_usage", "Get system usage"),
-        BotCommand("get_disk_usage", "Get disk usage")
+        BotCommand("get_disk_usage", "Get disk usage"),
+        BotCommand("monitor_system_usage", "Monitor system usage for 5 minutes"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -189,7 +191,56 @@ async def get_machine_specs(update: Update, context) -> None:
     except Exception as e:
         await update.message.reply_text(f'Error retrieving machine specs: {str(e)}')
 
-# Helper function to get detailed RAM information on Linux
+async def monitor_system_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_user_authorized(update.message.from_user.id):
+        await update.message.reply_text("❌ You are not authorized to run commands.")
+        return
+
+    message = await update.message.reply_text("🟢 **Monitoring system usage...** ⏳", parse_mode="Markdown")
+
+    async def monitor():
+        end_time = asyncio.get_event_loop().time() + 300  # 5 minutes from now
+        while asyncio.get_event_loop().time() < end_time:
+            try:
+                cpu_usage = round(psutil.cpu_percent(), 1)
+                memory = psutil.virtual_memory()
+                total_ram = round(memory.total / (1024 ** 3), 1)  # Convert to GB
+                used_ram = round(memory.used / (1024 ** 3), 1)
+                ram_usage = round(memory.percent, 1)
+
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    gpu = gpus[0]  # Assuming monitoring the first GPU
+                    total_gpu_mem = round(gpu.memoryTotal, 1)
+                    used_gpu_mem = round(gpu.memoryUsed, 1)
+                    gpu_usage = round(gpu.memoryUtil * 100, 1)
+                    gpu_info = f"🟣 **GPU Usage:** {gpu_usage}% ({used_gpu_mem}/{total_gpu_mem} GB)"
+                else:
+                    gpu_info = "🚫 **No GPU detected.**"
+
+                time_left = end_time - asyncio.get_event_loop().time()
+                if time_left > 60:
+                    time_left_str = f"{int(time_left // 60)}m"
+                else:
+                    time_left_str = f"{int(time_left)}s"
+
+                response = (
+                    f"🟢 **Monitoring system usage...** ⏳ {time_left_str}\n"
+                    f"🟡 **CPU Usage:** {cpu_usage}%\n"
+                    f"🔵 **RAM Usage:** {ram_usage}% ({used_ram}/{total_ram} GB)\n"
+                    f"{gpu_info}"
+                )
+                await message.edit_text(response, parse_mode="Markdown")
+            except Exception as e:
+                await message.edit_text(f'⚠️ **Error retrieving system usage:** {str(e)}', parse_mode="Markdown")
+                break
+
+            await asyncio.sleep(0.5)  # Update every 500ms
+
+        await message.edit_text("🛑 **Monitoring stopped.**", parse_mode="Markdown")
+
+    context.application.create_task(monitor())  # Run in the background
+
 def get_ram_info():
     try:
         result = subprocess.run(["sudo", "dmidecode", "--type", "17"], capture_output=True, text=True)

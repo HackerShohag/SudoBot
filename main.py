@@ -18,7 +18,8 @@ async def main():
                 CommandHandler("get_system_info", menu.get_system_info),
                 CommandHandler("get_machine_specs", menu.get_machine_specs),
                 CommandHandler("get_system_usage", menu.get_system_usage),
-                CommandHandler("get_disk_usage", menu.get_disk_usage)
+                CommandHandler("get_disk_usage", menu.get_disk_usage),
+                CommandHandler("monitor_system_usage", menu.monitor_system_usage),
             ],
             states={AWAITING_SUDO_PASSWORD: [MessageHandler(
                 filters.TEXT & ~filters.COMMAND, password_input)]},
