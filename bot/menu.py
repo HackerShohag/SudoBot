@@ -87,33 +87,38 @@ async def get_system_usage(update: Update, context) -> None:
     
     try:
         # Get CPU usage and count
-        cpu_usage = psutil.cpu_percent(interval=1)
+        cpu_usage = round(psutil.cpu_percent(interval=1), 1)
         cpu_count = psutil.cpu_count(logical=True)
         
         # Get RAM usage and total
         memory = psutil.virtual_memory()
-        ram_usage = memory.percent
-        ram_total = memory.total // (2**30)  # Convert bytes to GiB
+        ram_usage = round(memory.percent, 1)
+        ram_used = round(memory.used / (2**30), 1) # Convert bytes to GiB 
+        ram_total = round(memory.total // (2**30), 1)  # Convert bytes to GiB
         
         # Get GPU usage and total memory (if available)
         try:
             gpus = GPUtil.getGPUs()
             if gpus:
                 gpu = gpus[0]
-                gpu_usage = gpu.load * 100
+                gpu_usage = round(gpu.load * 100, 1)
+                gpu_used_memory = gpu.memoryUsed
                 gpu_total_memory = gpu.memoryTotal
             else:
                 gpu_usage = 'N/A'
+                gpu_used_memory = 'N/A'
                 gpu_total_memory = 'N/A'
         except ImportError:
             gpu_usage = 'GPUtil not installed'
+            gpu_used_memory = 'N/A'
             gpu_total_memory = 'N/A'
         
         response = (
             f"CPU Usage: {cpu_usage}% ({cpu_count} Cores)\n"
-            f"RAM Usage: {ram_usage}% ({ram_total} GiB)\n"
+            f"RAM Usage: {ram_usage}% ({ram_used} GiB/{ram_total} GiB)\n"
             f"GPU Usage: {gpu_usage if isinstance(gpu_usage, str) else f'{gpu_usage}%'} "
-            f"({gpu_total_memory if isinstance(gpu_total_memory, str) else f'{gpu_total_memory} MiB'})"
+            f"({gpu_used_memory if isinstance(gpu_used_memory, str) else f'{gpu_used_memory} MiB'}/"
+            f"{gpu_total_memory if isinstance(gpu_total_memory, str) else f'{gpu_total_memory} MiB'})"
         )
         await update.message.reply_text(response)
     except Exception as e:
