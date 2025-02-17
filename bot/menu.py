@@ -233,7 +233,7 @@ async def monitor_system_usage(update: Update, context: ContextTypes.DEFAULT_TYP
 
             await asyncio.sleep(0.5)  # Update every 500ms
 
-        final_response = ("🛑 **Stoped Monitoring.**")
+        final_response = ("🛑 **Stopped Monitoring.**")
         # final_response = re.sub(r"\d+m|\d+s", "", final_response)
         await message.edit_text(final_response, parse_mode="Markdown")
 
