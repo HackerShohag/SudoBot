@@ -215,15 +215,15 @@ async def monitor_system_usage(update: Update, context: ContextTypes.DEFAULT_TYP
                     gpu_usage = round(gpu.memoryUtil * 100, 1)
                     used_gpu_mem = round(gpu.memoryUsed, 1)
                     total_gpu_mem = round(gpu.memoryTotal, 1)
-                    gpu_info = f"🟣 **GPU Usage:** {gpu_usage}% ({used_gpu_mem}/{total_gpu_mem} GB)"
+                    gpu_info = f"**GPU Usage:** {gpu_usage}% ({used_gpu_mem}/{total_gpu_mem} MiB)"
 
                 time_left = end_time - asyncio.get_event_loop().time()
-                time_left_str = f"{int(time_left // 60)}m" if time_left > 60 else f"{int(time_left)}s"
+                time_left_str = f"{round(time_left / 60)}m" if time_left > 60 else f"{int(time_left)}s"
 
                 response = (
-                    f"🟢 **Monitoring system usage...** ⏳ {time_left_str}\n"
-                    f"🟡 **CPU Usage:** {cpu_usage}%\n"
-                    f"🔵 **RAM Usage:** {ram_usage}% ({used_ram}/{total_ram} GB)\n"
+                    f"🟢 **Monitoring...** { ("⏳" + time_left_str).rjust(30)}\n"
+                    f"**CPU Usage:** {cpu_usage}%\n"
+                    f"**RAM Usage:** {ram_usage}% ({used_ram}/{total_ram} GiB)\n"
                     f"{gpu_info}"
                 )
                 await message.edit_text(response, parse_mode="Markdown")
@@ -233,7 +233,8 @@ async def monitor_system_usage(update: Update, context: ContextTypes.DEFAULT_TYP
 
             await asyncio.sleep(0.5)  # Update every 500ms
 
-        final_response = response.replace("🟢 **Monitoring system usage...** ⏳", "🛑 **Stopped monitoring system usage.**")
+        final_response = ("🛑 **Stoped Monitoring.**")
+        # final_response = re.sub(r"\d+m|\d+s", "", final_response)
         await message.edit_text(final_response, parse_mode="Markdown")
 
     context.application.create_task(monitor())  # Run in the background

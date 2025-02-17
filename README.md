@@ -105,6 +105,7 @@ pkill -f main.py
 #### 📌 Run All Tests
 ```bash
 python3 -m unittest discover tests
+python3 -m unittest discover tests/bot
 ```
 
 #### 📌 Run Specific Test File
