@@ -1,24 +1,23 @@
 import asyncio
 from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
+from telegram.error import RetryAfter
 from bot.keyboard import update_command_history, update_keyboard
 from bot.utils import is_user_authorized
 from bot.config import MAX_CHARS
+import signal
 
 AWAITING_SUDO_PASSWORD = 1
 running_process = None  # Global variable to store the running process
 
-# Modify the execute_command function to update the command counter and last run command
 async def execute_command(command: str, update, context, reply_to_message_id):
     global running_process
     running_process = await asyncio.create_subprocess_shell(
         command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
 
-    # Update command frequency counter and last run command
     update_command_history(update, context)
 
-    # Reply to the original message that sent the command
     message = await context.bot.send_message(
         chat_id=update.message.chat_id,
         text="Running command...",
@@ -26,27 +25,36 @@ async def execute_command(command: str, update, context, reply_to_message_id):
     )
 
     output_lines = []
-    max_chars = 4000  # Prevent Telegram message limit error
+    max_chars = 4000
+    last_edit_time = asyncio.get_event_loop().time()  # Track last edit time
 
     async for line in running_process.stdout:
         output_lines.append(line.decode().strip())
-        output_text = "\n".join(output_lines[-20:])  # Keep last 20 lines
+        output_text = "\n".join(output_lines[-20:])  # Last 20 lines
 
         if len(output_text) > max_chars:
-            await context.bot.edit_message_text(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
-                message_id=message.message_id,
-                text="Output too long! Sending full output in separate messages..."
+                text="Output too long! Sending full output in separate messages...",
+                reply_to_message_id=reply_to_message_id
             )
             await send_large_output(update, context, output_lines, reply_to_message_id)
             return
 
-        await context.bot.edit_message_text(
-            chat_id=update.message.chat_id,
-            message_id=message.message_id,
-            text=f"```\n{output_text}\n```",
-            parse_mode='MarkdownV2'
-        )
+        new_text = f"```\n{output_text}\n```"
+
+        # Limit message edits to avoid flood control
+        if message.text != new_text and (asyncio.get_event_loop().time() - last_edit_time > 3):  # Edit every 3 seconds
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=update.message.chat_id,
+                    message_id=message.message_id,
+                    text=new_text,
+                    parse_mode='MarkdownV2'
+                )
+                last_edit_time = asyncio.get_event_loop().time()  # Update last edit time
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after)  # Wait if Telegram blocks edits
 
     err = await running_process.stderr.read()
     if err:
@@ -54,11 +62,9 @@ async def execute_command(command: str, update, context, reply_to_message_id):
         await send_large_output(update, context, output_lines, reply_to_message_id)
 
     await running_process.wait()
-    running_process = None  # Reset the running process
+    running_process = None
 
-    # Update the keyboard with frequent and last commands
     await update_keyboard(update, context)
-
 
 async def send_large_output(update: Update, context: ContextTypes.DEFAULT_TYPE, output_lines, reply_to_message_id):
     """Splits large command output into multiple messages to prevent errors."""
@@ -130,10 +136,13 @@ async def password_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running_process
     if running_process and running_process.returncode is None:
-        running_process.terminate()
+        running_process.send_signal(signal.SIGTERM)  # Send SIGTERM instead of terminate()
+        try:
+            await asyncio.wait_for(running_process.wait(), timeout=5)  # Give it time to exit
+        except asyncio.TimeoutError:
+            running_process.kill()  # Force kill if it does not stop
+        running_process = None  # Reset process reference
         await update.message.reply_text("✅ Command execution stopped.")
+        await update_keyboard(update, context)
     else:
-        await update.message.reply_text("⚠️ No running command to stop.")
-
-# Add the stop_command handler to your dispatcher
-# dispatcher.add_handler(CommandHandler('stop', stop_command))
+        await update.message.reply_text("⚠️ No command is currently running.")
