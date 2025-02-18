@@ -33,10 +33,11 @@ async def execute_command(command: str, update, context, reply_to_message_id):
         output_text = "\n".join(output_lines[-20:])  # Last 20 lines
 
         if len(output_text) > max_chars:
-            await context.bot.send_message(
+            await context.bot.edit_message_text(
                 chat_id=update.message.chat_id,
+                message_id=message.message_id,
                 text="Output too long! Sending full output in separate messages...",
-                reply_to_message_id=reply_to_message_id
+                parse_mode='MarkdownV2'
             )
             await send_large_output(update, context, output_lines, reply_to_message_id)
             return
@@ -59,7 +60,19 @@ async def execute_command(command: str, update, context, reply_to_message_id):
     err = await running_process.stderr.read()
     if err:
         output_lines.append(f"\nError:\n{err.decode().strip()}")
-        await send_large_output(update, context, output_lines, reply_to_message_id)
+        await context.bot.edit_message_text(
+            chat_id=update.message.chat_id,
+            message_id=message.message_id,
+            text=f"```\n{output_text}\n\nError:\n{err.decode().strip()}\n```",
+            parse_mode='MarkdownV2'
+        )
+    else:
+        await context.bot.edit_message_text(
+            chat_id=update.message.chat_id,
+            message_id=message.message_id,
+            text=f"```\n{output_text}\n```",
+            parse_mode='MarkdownV2'
+        )
 
     await running_process.wait()
     running_process = None
