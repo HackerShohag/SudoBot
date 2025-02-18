@@ -15,6 +15,7 @@ import asyncio
 async def set_bot_menu(application):
     commands = [
         BotCommand("run", "Run a command"),
+        BotCommand("stop", "Stop the running command"),
         BotCommand("get_local_ip", "Get your local IP address"),
         BotCommand("get_public_ip", "Get your public IP address"),
         BotCommand("get_system_info", "Get system information"),

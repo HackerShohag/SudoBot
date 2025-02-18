@@ -6,10 +6,12 @@ from bot.utils import is_user_authorized
 from bot.config import MAX_CHARS
 
 AWAITING_SUDO_PASSWORD = 1
+running_process = None  # Global variable to store the running process
 
 # Modify the execute_command function to update the command counter and last run command
 async def execute_command(command: str, update, context, reply_to_message_id):
-    process = await asyncio.create_subprocess_shell(
+    global running_process
+    running_process = await asyncio.create_subprocess_shell(
         command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
 
@@ -26,7 +28,7 @@ async def execute_command(command: str, update, context, reply_to_message_id):
     output_lines = []
     max_chars = 4000  # Prevent Telegram message limit error
 
-    async for line in process.stdout:
+    async for line in running_process.stdout:
         output_lines.append(line.decode().strip())
         output_text = "\n".join(output_lines[-20:])  # Keep last 20 lines
 
@@ -46,12 +48,13 @@ async def execute_command(command: str, update, context, reply_to_message_id):
             parse_mode='MarkdownV2'
         )
 
-    err = await process.stderr.read()
+    err = await running_process.stderr.read()
     if err:
         output_lines.append(f"\nError:\n{err.decode().strip()}")
         await send_large_output(update, context, output_lines, reply_to_message_id)
 
-    await process.wait()
+    await running_process.wait()
+    running_process = None  # Reset the running process
 
     # Update the keyboard with frequent and last commands
     await update_keyboard(update, context)
@@ -123,3 +126,14 @@ async def password_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await execute_command(full_command, update, context, original_message_id)
     
     return ConversationHandler.END
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global running_process
+    if running_process and running_process.returncode is None:
+        running_process.terminate()
+        await update.message.reply_text("✅ Command execution stopped.")
+    else:
+        await update.message.reply_text("⚠️ No running command to stop.")
+
+# Add the stop_command handler to your dispatcher
+# dispatcher.add_handler(CommandHandler('stop', stop_command))

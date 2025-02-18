@@ -1,7 +1,7 @@
 import asyncio
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, CallbackQueryHandler
 from bot.config import BOT_TOKEN
-from bot.bot import run_command, password_input, AWAITING_SUDO_PASSWORD
+from bot.bot import run_command, password_input, stop_command, AWAITING_SUDO_PASSWORD
 from bot.keyboard import handle_command_from_keyboard
 from bot import menu
 from bot.utils import authorize_user, remove_user
@@ -13,6 +13,7 @@ async def main():
         ConversationHandler(
             entry_points=[
                 CommandHandler('run', run_command),
+                CommandHandler('stop', stop_command),
                 CommandHandler("get_local_ip", menu.get_local_ip),
                 CommandHandler("get_public_ip", menu.get_public_ip),
                 CommandHandler("get_system_info", menu.get_system_info),
