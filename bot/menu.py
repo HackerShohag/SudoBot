@@ -9,8 +9,11 @@ import psutil
 import GPUtil
 import subprocess
 
-from bot.utils import is_user_authorized
+from bot.utils import is_user_authorized, get_ram_info
 import asyncio
+
+
+UPLOAD_DIR = "uploads"
 
 async def set_bot_menu(application):
     commands = [
@@ -204,6 +207,7 @@ async def monitor_system_usage(update: Update, context: ContextTypes.DEFAULT_TYP
         while asyncio.get_event_loop().time() < end_time:
             try:
                 cpu_usage = round(psutil.cpu_percent(), 1)
+                cpu_cores = psutil.cpu_count(logical=True)
                 memory = psutil.virtual_memory()
                 ram_usage = round(memory.percent, 1)
                 used_ram = round(memory.used / (1024 ** 3), 1)
@@ -223,7 +227,7 @@ async def monitor_system_usage(update: Update, context: ContextTypes.DEFAULT_TYP
 
                 response = (
                     f"🟢 **Monitoring...** { ("⏳" + time_left_str).rjust(30)}\n"
-                    f"**CPU Usage:** {cpu_usage}%\n"
+                    f"**CPU Usage:** {cpu_usage}% ({cpu_cores} cores)\n"
                     f"**RAM Usage:** {ram_usage}% ({used_ram}/{total_ram} GiB)\n"
                     f"{gpu_info}"
                 )
@@ -239,29 +243,3 @@ async def monitor_system_usage(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.edit_text(final_response, parse_mode="Markdown")
 
     context.application.create_task(monitor())  # Run in the background
-
-def get_ram_info():
-    try:
-        result = subprocess.run(["sudo", "dmidecode", "--type", "17"], capture_output=True, text=True)
-        output = result.stdout
-
-        ram_info = []
-        for ram_block in output.split("\n\n"):
-            manufacturer = re.search(r"Manufacturer:\s+(.+)", ram_block)
-            speed = re.search(r"Speed:\s+(.+)", ram_block)
-            ram_type = re.search(r"Type:\s+(.+)", ram_block)
-            form_factor = re.search(r"Form Factor:\s+(.+)", ram_block)
-            size = re.search(r"Size:\s+(.+)", ram_block)
-
-            if size and "No Module Installed" not in size.group(1):  # Ignore empty slots
-                ram_info.append({
-                    "Manufacturer": manufacturer.group(1) if manufacturer else "Unknown",
-                    "Speed": speed.group(1) if speed else "Unknown",
-                    "Type": ram_type.group(1) if ram_type else "Unknown",
-                    "Form Factor": form_factor.group(1) if form_factor else "Unknown",
-                    "Size": size.group(1)
-                })
-
-        return ram_info
-    except Exception as e:
-        return [f"Error retrieving RAM info: {str(e)}"]

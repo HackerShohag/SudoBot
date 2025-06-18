@@ -1,7 +1,11 @@
 import sqlite3
+import subprocess
 from telegram import Update
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, CallbackContext
+import os
+import re
 
+UPLOAD_DIR = "uploads"
 DB_PATH = "db/authorized_users.db"
 
 def init_db():
@@ -19,6 +23,8 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+
+init_db()
 
 def get_user_role(user_id: int) -> str:
     conn = sqlite3.connect(DB_PATH)
@@ -99,4 +105,43 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✅ User {username} has been removed.")
 
-init_db()
+async def handle_file_upload(update: Update, context: CallbackContext) -> None:
+    document = update.message.document
+    file_id = document.file_id
+    file = await context.bot.get_file(file_id)
+
+    # Ensure the upload directory exists
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+    file_path = os.path.join(UPLOAD_DIR, document.file_name)
+    
+    # Download the file
+    await file.download_to_drive(file_path)
+
+    await update.message.reply_text(f"File uploaded successfully: `{file_path}`", parse_mode="MarkdownV2")
+
+def get_ram_info():
+    try:
+        result = subprocess.run(["sudo", "dmidecode", "--type", "17"], capture_output=True, text=True)
+        output = result.stdout
+
+        ram_info = []
+        for ram_block in output.split("\n\n"):
+            manufacturer = re.search(r"Manufacturer:\s+(.+)", ram_block)
+            speed = re.search(r"Speed:\s+(.+)", ram_block)
+            ram_type = re.search(r"Type:\s+(.+)", ram_block)
+            form_factor = re.search(r"Form Factor:\s+(.+)", ram_block)
+            size = re.search(r"Size:\s+(.+)", ram_block)
+
+            if size and "No Module Installed" not in size.group(1):  # Ignore empty slots
+                ram_info.append({
+                    "Manufacturer": manufacturer.group(1) if manufacturer else "Unknown",
+                    "Speed": speed.group(1) if speed else "Unknown",
+                    "Type": ram_type.group(1) if ram_type else "Unknown",
+                    "Form Factor": form_factor.group(1) if form_factor else "Unknown",
+                    "Size": size.group(1)
+                })
+
+        return ram_info
+    except Exception as e:
+        return [f"Error retrieving RAM info: {str(e)}"]

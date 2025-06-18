@@ -4,7 +4,9 @@ from bot.config import BOT_TOKEN
 from bot.bot import run_command, password_input, stop_command, AWAITING_SUDO_PASSWORD
 from bot.keyboard import handle_command_from_keyboard
 from bot import menu
-from bot.utils import authorize_user, remove_user
+from bot.utils import authorize_user, remove_user, handle_file_upload
+from telegram.ext import CommandHandler, MessageHandler, filters
+from bot.bot import execute_on_file
 
 async def main():
     application = Application.builder().token(BOT_TOKEN).build()
@@ -13,6 +15,8 @@ async def main():
         ConversationHandler(
             entry_points=[
                 CommandHandler('run', run_command),
+                MessageHandler(filters.Document.ALL, handle_file_upload),
+                CommandHandler("runfile", execute_on_file),
                 CommandHandler('stop', stop_command),
                 CommandHandler("get_local_ip", menu.get_local_ip),
                 CommandHandler("get_public_ip", menu.get_public_ip),

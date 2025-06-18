@@ -1,14 +1,17 @@
 import asyncio
 from telegram import Update
-from telegram.ext import ContextTypes, ConversationHandler
+from telegram.ext import ContextTypes, ConversationHandler, CallbackContext
 from telegram.error import RetryAfter
 from bot.keyboard import update_command_history, update_keyboard
 from bot.utils import is_user_authorized
 from bot.config import MAX_CHARS
 import signal
+import subprocess
+import os
 
 AWAITING_SUDO_PASSWORD = 1
-running_process = None  # Global variable to store the running process
+running_process = None
+UPLOAD_DIR = "uploads"
 
 async def execute_command(command: str, update, context, reply_to_message_id):
     global running_process
@@ -30,7 +33,10 @@ async def execute_command(command: str, update, context, reply_to_message_id):
 
     async for line in running_process.stdout:
         output_lines.append(line.decode().strip())
-        output_text = "\n".join(output_lines[-20:])  # Last 20 lines
+        output_text = "\n".join(output_lines)  # Last 20 lines
+
+        if not output_text:
+            output_text = "The command has no output."
 
         if len(output_text) > max_chars:
             await context.bot.edit_message_text(
@@ -78,6 +84,33 @@ async def execute_command(command: str, update, context, reply_to_message_id):
     running_process = None
 
     await update_keyboard(update, context)
+
+async def execute_on_file(update: Update, context: CallbackContext) -> None:
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: `/runfile <filename> <command>`", parse_mode="MarkdownV2")
+        return
+
+    filename = context.args[0]  # Get filename
+    command = " ".join(context.args[1:])  # Get the command  
+    file_path = os.path.join(UPLOAD_DIR, filename)
+
+    if not os.path.exists(file_path):
+        await update.message.reply_text("❌ File not found.")
+        return
+
+    # Replace `{file}` with the actual file path
+    command = command.replace("{file}", f"'{file_path}'")
+
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            await update.message.reply_text(f"✅ Command executed successfully!\n```\n{result.stdout}\n```", parse_mode="MarkdownV2")
+        else:
+            await update.message.reply_text(f"❌ Command failed:\n```\n{result.stderr}\n```", parse_mode="MarkdownV2")
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error executing command: `{str(e)}`", parse_mode="MarkdownV2")
 
 async def send_large_output(update: Update, context: ContextTypes.DEFAULT_TYPE, output_lines, reply_to_message_id):
     """Splits large command output into multiple messages to prevent errors."""
