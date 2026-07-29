@@ -12,3 +12,6 @@ sh/*
 
 # logs
 log
+
+# runtime uploads
+uploads/

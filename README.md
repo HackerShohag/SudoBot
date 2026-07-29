@@ -9,6 +9,20 @@ SudoBot is a powerful **Telegram Bot** that allows users to execute commands, re
 - 📜 **Menu Integration:** Access bot features via a built-in menu.
 - 🔑 **Sudo Support:** Securely run commands as superuser.
 - 🛠️ **Systemd Service Support:** Run the bot as a background system service.
+- 🖨️ **PDF Print Splitting:** Separate uploaded PDFs into B&W and color files.
+
+## 🖨️ Splitting PDFs for Printing
+
+You can use the PDF splitter in any of these ways:
+
+1. Upload a PDF, then send `/splitpdf`.
+2. Upload a PDF, then send `/splitpdf --duplex` (or `/splitpdf -d`).
+3. Reply to an existing PDF with `/splitpdf` or `/splitpdf --duplex`.
+4. Upload a PDF with `/splitpdf --duplex` as its caption.
+
+Simplex mode removes color pages from the B&W output. Duplex mode preserves
+page positions with blanks and reports the sheet side where each color page
+must be overprinted. `/printer` is an alias for `/splitpdf`.
 
 ---
 

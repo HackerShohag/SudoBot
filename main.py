@@ -4,18 +4,29 @@ from bot.config import BOT_TOKEN
 from bot.bot import run_command, password_input, stop_command, AWAITING_SUDO_PASSWORD
 from bot.keyboard import handle_command_from_keyboard
 from bot import menu
-from bot.utils import authorize_user, remove_user, handle_file_upload
+from bot.utils import authorize_user, remove_user, handle_file_upload, split_pdf
 from telegram.ext import CommandHandler, MessageHandler, filters
 from bot.bot import execute_on_file
 
 async def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(120)
+        .write_timeout(120)
+        .media_write_timeout(300)
+        .pool_timeout(30)
+        .build()
+    )
 
     application.add_handler(
         ConversationHandler(
             entry_points=[
                 CommandHandler('run', run_command),
                 MessageHandler(filters.Document.ALL, handle_file_upload),
+                CommandHandler("splitpdf", split_pdf),
+                CommandHandler("printer", split_pdf),
                 CommandHandler("runfile", execute_on_file),
                 CommandHandler('stop', stop_command),
                 CommandHandler("get_local_ip", menu.get_local_ip),
