@@ -24,6 +24,12 @@ Simplex mode removes color pages from the B&W output. Duplex mode preserves
 page positions with blanks and reports the sheet side where each color page
 must be overprinted. `/printer` is an alias for `/splitpdf`.
 
+In privacy-enabled Telegram groups, the Bot API may not expose a PDF that was
+sent before the command. If that happens, the bot prompts for the file: reply
+directly to the bot's prompt with the PDF and it will split it automatically.
+Disabling group privacy for the bot through BotFather also lets it receive
+ordinary file messages.
+
 ---
 
 ## 🛠️ Installation

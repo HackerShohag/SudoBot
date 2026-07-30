@@ -9,7 +9,6 @@ from typing import Optional
 from telegram import Update
 from telegram.ext import ContextTypes, CallbackContext
 from telegram.error import NetworkError, RetryAfter, TelegramError
-import os
 import re
 from pathlib import Path
 
@@ -395,28 +394,61 @@ async def handle_file_upload(update: Update, context: CallbackContext) -> None:
     file_id = document.file_id
     file = await context.bot.get_file(file_id)
 
-    # Ensure the upload directory exists
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-    safe_name = Path(document.file_name or "upload").name
-    file_path = os.path.join(UPLOAD_DIR, safe_name)
+    file_path = _upload_file_path(
+        update.effective_chat.id,
+        update.message.message_id,
+        document.file_name or "upload",
+    )
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Download the file
-    await file.download_to_drive(file_path)
-
-    context.user_data["last_uploaded_file"] = file_path
+    await file.download_to_drive(str(file_path))
+    if _is_pdf_document(document):
+        _remember_chat_pdf(
+            context,
+            update.message.message_id,
+            file_path,
+        )
 
     caption_args = _splitpdf_caption_args(update.message.caption)
     if caption_args is not None:
-        await split_pdf(update, context, args=caption_args, input_path=file_path)
+        context.user_data.pop("pending_pdf_split", None)
+        await split_pdf(
+            update,
+            context,
+            args=caption_args,
+            input_path=str(file_path),
+        )
+        return
+
+    pending_split = context.user_data.get("pending_pdf_split")
+    current_chat_id = update.effective_chat.id
+    if (
+        pending_split
+        and pending_split.get("chat_id") == current_chat_id
+    ):
+        if not _is_pdf_document(document):
+            await update.message.reply_text(
+                "❌ That file is not a PDF. Reply with a PDF to continue."
+            )
+            return
+        context.user_data.pop("pending_pdf_split", None)
+        await split_pdf(
+            update,
+            context,
+            args=pending_split["args"],
+            input_path=str(file_path),
+        )
         return
 
     suffix = (
         "\nUse /splitpdf or /splitpdf --duplex to split this PDF."
-        if safe_name.lower().endswith(".pdf")
+        if _is_pdf_document(document)
         else ""
     )
-    await update.message.reply_text(f"File uploaded successfully: {file_path}{suffix}")
+    await update.message.reply_text(
+        f"File uploaded successfully: {file_path}{suffix}"
+    )
 
 
 def _splitpdf_caption_args(caption):
@@ -448,19 +480,241 @@ def _duplex_from_args(args):
     )
 
 
-async def _download_replied_pdf(update, context):
-    replied = update.message.reply_to_message
-    document = replied.document if replied else None
-    if not document:
+def _is_pdf_document(document):
+    if document is None:
+        return False
+    file_name = (getattr(document, "file_name", None) or "").lower()
+    mime_type = (getattr(document, "mime_type", None) or "").lower()
+    return file_name.endswith(".pdf") or mime_type == "application/pdf"
+
+
+def _upload_file_path(chat_id, message_id, file_name):
+    safe_name = Path(file_name or "upload").name
+    return (
+        Path(UPLOAD_DIR)
+        / str(chat_id)
+        / str(message_id)
+        / safe_name
+    )
+
+
+def _remember_chat_pdf(context, message_id, file_path):
+    file_path = str(file_path)
+    context.chat_data["last_uploaded_pdf"] = file_path
+    context.chat_data.setdefault("uploaded_pdfs", {})[
+        str(message_id)
+    ] = file_path
+
+
+def _pdf_from_attachment(attachment):
+    attachments = (
+        attachment
+        if isinstance(attachment, (list, tuple))
+        else [attachment]
+    )
+    return next(
+        (
+            item
+            for item in attachments
+            if _is_pdf_document(item)
+        ),
+        None,
+    )
+
+
+def _find_replied_pdf_document(message):
+    """Find a PDF in normal, quoted, or cross-chat Telegram replies."""
+    if message is None:
         return None
 
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    safe_name = Path(document.file_name or "upload.pdf").name
-    file_path = os.path.join(UPLOAD_DIR, safe_name)
+    replied = getattr(message, "reply_to_message", None)
+    candidates = [replied]
+    if replied is not None:
+        candidates.append(getattr(replied, "external_reply", None))
+        candidates.append(getattr(replied, "reply_to_message", None))
+    candidates.append(getattr(message, "external_reply", None))
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        document = getattr(candidate, "document", None)
+        if _is_pdf_document(document):
+            return document
+        document = _pdf_from_attachment(
+            getattr(candidate, "effective_attachment", None)
+        )
+        if document:
+            return document
+    return None
+
+
+def _reply_message_reference(message, current_chat_id):
+    """Return the source (chat_id, message_id) for a Telegram reply."""
+    if message is None:
+        return None
+
+    replied = getattr(message, "reply_to_message", None)
+    candidates = [replied]
+    if replied is not None:
+        candidates.append(getattr(replied, "external_reply", None))
+        candidates.append(getattr(replied, "reply_to_message", None))
+    candidates.append(getattr(message, "external_reply", None))
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        message_id = getattr(candidate, "message_id", None)
+        if message_id is None:
+            continue
+        chat = getattr(candidate, "chat", None)
+        chat_id = getattr(chat, "id", None) or current_chat_id
+        return chat_id, message_id
+    return None
+
+
+def _has_explicit_reply(message):
+    return bool(
+        getattr(message, "reply_to_message", None)
+        or getattr(message, "external_reply", None)
+    )
+
+
+def _cached_replied_pdf(message, current_chat_id, context):
+    reference = _reply_message_reference(message, current_chat_id)
+    if reference is None:
+        return None
+    source_chat_id, message_id = reference
+    message_dir = (
+        Path(UPLOAD_DIR)
+        / str(source_chat_id)
+        / str(message_id)
+    )
+
+    if source_chat_id == current_chat_id:
+        cached = context.chat_data.get("uploaded_pdfs", {}).get(
+            str(message_id)
+        )
+        if (
+            cached
+            and Path(cached).is_file()
+            and Path(cached).parent == message_dir
+        ):
+            return cached
+
+    if not message_dir.is_dir():
+        return None
+    return next(
+        (
+            str(path)
+            for path in message_dir.iterdir()
+            if path.is_file() and path.suffix.lower() == ".pdf"
+        ),
+        None,
+    )
+
+
+def _latest_chat_pdf(current_chat_id, context):
+    cached = context.chat_data.get("last_uploaded_pdf")
+    if cached and Path(cached).is_file():
+        return cached
+
+    chat_dir = Path(UPLOAD_DIR) / str(current_chat_id)
+    if not chat_dir.is_dir():
+        return None
+    pdfs = [
+        path
+        for path in chat_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() == ".pdf"
+    ]
+    return str(max(pdfs, key=lambda path: path.stat().st_mtime)) if pdfs else None
+
+
+async def _download_pdf_document(
+    context,
+    document,
+    source_chat_id,
+    source_message_id,
+):
+    file_path = _upload_file_path(
+        source_chat_id,
+        source_message_id,
+        document.file_name or "upload.pdf",
+    )
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     telegram_file = await context.bot.get_file(document.file_id)
-    await telegram_file.download_to_drive(file_path)
-    context.user_data["last_uploaded_file"] = file_path
+    await telegram_file.download_to_drive(str(file_path))
+    return str(file_path)
+
+
+async def _download_replied_pdf(update, context):
+    message = getattr(update, "effective_message", None) or update.message
+    document = _find_replied_pdf_document(message)
+    if document is None:
+        return None
+
+    current_chat_id = update.effective_chat.id
+    reference = _reply_message_reference(message, current_chat_id)
+    source_chat_id, source_message_id = reference or (
+        current_chat_id,
+        update.message.message_id,
+    )
+    file_path = await _download_pdf_document(
+        context,
+        document,
+        source_chat_id,
+        source_message_id,
+    )
+    if source_chat_id == current_chat_id:
+        _remember_chat_pdf(context, source_message_id, file_path)
     return file_path
+
+
+async def _recover_replied_group_pdf(update, context):
+    """Recover an inaccessible replied file via a temporary private forward."""
+    message = getattr(update, "effective_message", None) or update.message
+    reference = _reply_message_reference(message, update.effective_chat.id)
+    if reference is None:
+        return None
+    source_chat_id, source_message_id = reference
+    target_chat_id = update.effective_user.id
+    forwarded = None
+
+    try:
+        forwarded = await context.bot.forward_message(
+            chat_id=target_chat_id,
+            from_chat_id=source_chat_id,
+            message_id=source_message_id,
+            disable_notification=True,
+        )
+        document = _find_replied_pdf_document(
+            type(
+                "ForwardWrapper",
+                (),
+                {"reply_to_message": forwarded, "external_reply": None},
+            )()
+        )
+        if document is None:
+            return None
+        file_path = await _download_pdf_document(
+            context,
+            document,
+            source_chat_id,
+            source_message_id,
+        )
+        if source_chat_id == update.effective_chat.id:
+            _remember_chat_pdf(context, source_message_id, file_path)
+        return file_path
+    except TelegramError:
+        return None
+    finally:
+        if forwarded is not None:
+            try:
+                await context.bot.delete_message(
+                    chat_id=target_chat_id,
+                    message_id=forwarded.message_id,
+                )
+            except TelegramError:
+                pass
 
 
 async def _send_pdf_with_retry(message, output_path, label):
@@ -508,13 +762,35 @@ async def split_pdf(update: Update, context: CallbackContext, args=None, input_p
         await update.message.reply_text(str(exc))
         return
 
+    message = getattr(update, "effective_message", None) or update.message
+    current_chat_id = update.effective_chat.id
+    explicit_reply = _has_explicit_reply(message)
+
     if input_path is None:
         input_path = await _download_replied_pdf(update, context)
-    if input_path is None:
-        input_path = context.user_data.get("last_uploaded_file")
+    if input_path is None and explicit_reply:
+        input_path = _cached_replied_pdf(
+            message,
+            current_chat_id,
+            context,
+        )
+    if input_path is None and explicit_reply:
+        input_path = await _recover_replied_group_pdf(update, context)
+    if input_path is None and not explicit_reply:
+        input_path = _latest_chat_pdf(current_chat_id, context)
     if not input_path:
+        pending_args = ["--duplex"] if duplex else []
+        context.user_data["pending_pdf_split"] = {
+            "args": pending_args,
+            "chat_id": update.effective_chat.id,
+        }
         await update.message.reply_text(
-            "Upload a PDF first, or reply to a PDF with /splitpdf [--duplex]."
+            "Telegram did not expose a downloadable PDF in that reply. "
+            "This commonly happens in groups when bot privacy is enabled.\n\n"
+            "Reply directly to this bot message with the PDF file. I will "
+            f"split it automatically in {'duplex' if duplex else 'simplex'} "
+            "mode.\n\n"
+            "You can also send the PDF with /splitpdf as its caption."
         )
         return
     if Path(input_path).suffix.lower() != ".pdf":
