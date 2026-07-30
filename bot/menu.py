@@ -31,7 +31,7 @@ async def set_bot_menu(application):
     await application.bot.set_my_commands(commands)
 
 async def get_local_ip(update: Update, context) -> None:
-    if not is_user_authorized(update.message.from_user.id):
+    if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to run commands.")
         return
 
@@ -44,7 +44,7 @@ async def get_local_ip(update: Update, context) -> None:
         await update.message.reply_text(f'Error retrieving local IP: {str(e)}')
 
 async def get_system_info(update: Update, context) -> None:
-    if not is_user_authorized(update.message.from_user.id):
+    if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to run commands.")
         return
     
@@ -63,7 +63,7 @@ async def get_system_info(update: Update, context) -> None:
         await update.message.reply_text(f'Error retrieving system info: {str(e)}')
 
 async def get_disk_usage(update: Update, context) -> None:
-    if not is_user_authorized(update.message.from_user.id):
+    if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to run commands.")
         return
     
@@ -79,7 +79,7 @@ async def get_disk_usage(update: Update, context) -> None:
         await update.message.reply_text(f'Error retrieving disk usage: {str(e)}')
 
 async def get_public_ip(update: Update, context) -> None:
-    if not is_user_authorized(update.message.from_user.id):
+    if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to run commands.")
         return
     
@@ -91,7 +91,7 @@ async def get_public_ip(update: Update, context) -> None:
         await update.message.reply_text(f'Error retrieving public IP: {str(e)}')
 
 async def get_system_usage(update: Update, context) -> None:
-    if not is_user_authorized(update.message.from_user.id):
+    if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to run commands.")
         return
     
@@ -135,7 +135,7 @@ async def get_system_usage(update: Update, context) -> None:
         await update.message.reply_text(f'Error retrieving system usage: {str(e)}')
 
 async def get_machine_specs(update: Update, context) -> None:
-    if not is_user_authorized(update.message.from_user.id):
+    if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to run commands.")
         return
 
@@ -197,7 +197,7 @@ async def get_machine_specs(update: Update, context) -> None:
         await update.message.reply_text(f'Error retrieving machine specs: {str(e)}')
 
 async def monitor_system_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_user_authorized(update.message.from_user.id):
+    if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to run commands.")
         return
 

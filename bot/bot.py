@@ -139,9 +139,7 @@ async def send_large_output(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         )
 
 async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-
-    if not is_user_authorized(user_id):
+    if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to run commands.")
         return
 

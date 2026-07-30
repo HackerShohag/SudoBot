@@ -168,65 +168,180 @@ def init_db():
 
 init_db()
 
-def get_user_role(user_id: int) -> str:
+def _telegram_identity(user_or_id):
+    if isinstance(user_or_id, int):
+        return user_or_id, None
+    return user_or_id.id, getattr(user_or_id, "username", None)
+
+
+def get_user_role(user_or_id) -> Optional[str]:
+    """Get a role and bind a pending username authorization when possible."""
+    user_id, username = _telegram_identity(user_or_id)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT role FROM authorized_users WHERE user_id = ?", (user_id,))
     role = cursor.fetchone()
+    if role is None and username:
+        try:
+            cursor.execute(
+                """
+                UPDATE authorized_users
+                SET user_id = ?
+                WHERE user_id IS NULL AND username = ? COLLATE NOCASE
+                """,
+                (user_id, username),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.rollback()
+        cursor.execute(
+            "SELECT role FROM authorized_users WHERE user_id = ?",
+            (user_id,),
+        )
+        role = cursor.fetchone()
     conn.close()
     return role[0] if role else None
 
-def is_user_authorized(user_id: int) -> bool:
-    return get_user_role(user_id) is not None
+def is_user_authorized(user_or_id) -> bool:
+    return get_user_role(user_or_id) is not None
 
-def is_admin(user_id: int) -> bool:
-    return get_user_role(user_id) == "admin"
+def is_admin(user_or_id) -> bool:
+    return get_user_role(user_or_id) == "admin"
 
 
 async def authorize_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
+    admin = update.message.from_user
 
-    if not is_admin(user_id):
+    if not is_admin(admin):
         await update.message.reply_text("❌ You are not authorized to add users.")
         return
 
     if len(context.args) == 0 and not update.message.reply_to_message:
-        await update.message.reply_text("Usage: /authorize <username> [role(admin/user)] or reply to a user's message.")
+        await update.message.reply_text(
+            "Usage: /authorize <username> [admin|user], or reply with "
+            "/authorize [admin|user]."
+        )
         return
 
-    if len(context.args) > 0:
-        username = context.args[0].lstrip('@')
-        role = context.args[1].lower() if len(context.args) > 1 else 'user'
-        full_name = update.message.reply_to_message.from_user.full_name if update.message.reply_to_message else update.message.from_user.full_name
-        user_id_to_add = update.message.reply_to_message.from_user.id if update.message.reply_to_message else None
+    replied_user = (
+        update.message.reply_to_message.from_user
+        if update.message.reply_to_message
+        else None
+    )
+    if replied_user:
+        username = replied_user.username
+        user_id_to_add = replied_user.id
+        full_name = replied_user.full_name
+        if context.args and context.args[0].lower() in {"admin", "user"}:
+            role = context.args[0].lower()
+        elif len(context.args) > 1:
+            role = context.args[1].lower()
+        else:
+            role = "user"
     else:
-        username = update.message.reply_to_message.from_user.username.lstrip('@')
-        full_name = update.message.reply_to_message.from_user.full_name
-        role = 'user'
-        user_id_to_add = update.message.reply_to_message.from_user.id
+        username = context.args[0].lstrip('@')
+        role = context.args[1].lower() if len(context.args) > 1 else "user"
+        full_name = None
+        user_id_to_add = None
 
     if role not in ["admin", "user"]:
         await update.message.reply_text("❌ Invalid role. Use 'admin' or 'user'.")
+        return
+    if not username and user_id_to_add is None:
+        await update.message.reply_text("❌ That user does not have a Telegram username.")
         return
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
-        cursor.execute(
-            "INSERT INTO authorized_users (username, user_id, full_name, added_by, role) VALUES (?, ?, ?, ?, ?)",
-            (username, user_id_to_add, full_name, update.message.from_user.username, role),
-        )
+        existing = None
+        if user_id_to_add is not None:
+            cursor.execute(
+                "SELECT id FROM authorized_users WHERE user_id = ?",
+                (user_id_to_add,),
+            )
+            existing = cursor.fetchone()
+        if existing is None and username:
+            cursor.execute(
+                """
+                SELECT id, user_id FROM authorized_users
+                WHERE username = ? COLLATE NOCASE
+                """,
+                (username,),
+            )
+            username_row = cursor.fetchone()
+            if (
+                username_row
+                and user_id_to_add is not None
+                and username_row[1] not in (None, user_id_to_add)
+            ):
+                await update.message.reply_text(
+                    "❌ That username is already bound to another Telegram account."
+                )
+                return
+            existing = username_row[:1] if username_row else None
+
+        if existing:
+            cursor.execute(
+                """
+                UPDATE authorized_users
+                SET username = COALESCE(?, username),
+                    user_id = COALESCE(?, user_id),
+                    full_name = COALESCE(?, full_name),
+                    added_by = ?,
+                    role = ?
+                WHERE id = ?
+                """,
+                (
+                    username,
+                    user_id_to_add,
+                    full_name,
+                    admin.username,
+                    role,
+                    existing[0],
+                ),
+            )
+            action = "updated"
+        else:
+            cursor.execute(
+                """
+                INSERT INTO authorized_users
+                    (username, user_id, full_name, added_by, role)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    username,
+                    user_id_to_add,
+                    full_name,
+                    admin.username,
+                    role,
+                ),
+            )
+            action = "authorized"
         conn.commit()
-        await update.message.reply_text(f"✅ User {username} authorized as {role}.")
+        display_name = f"@{username}" if username else f"ID {user_id_to_add}"
+        if user_id_to_add is None:
+            await update.message.reply_text(
+                f"✅ User {display_name} {action} as {role}. "
+                "Their Telegram ID will be linked when they next use the bot."
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ User {display_name} {action} as {role}."
+            )
     except sqlite3.IntegrityError:
-        await update.message.reply_text("❌ User is already authorized.")
+        conn.rollback()
+        await update.message.reply_text(
+            "❌ Could not authorize this identity because it conflicts with "
+            "another authorized account."
+        )
     finally:
         conn.close()
 
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
+    admin = update.message.from_user
 
-    if not is_admin(user_id):
+    if not is_admin(admin):
         await update.message.reply_text("❌ You are not authorized to remove users.")
         return
 
@@ -234,22 +349,45 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /remove <username> or reply to a user's message.")
         return
 
+    replied_user = (
+        update.message.reply_to_message.from_user
+        if update.message.reply_to_message
+        else None
+    )
     if len(context.args) > 0:
         username = context.args[0].lstrip('@')
+        user_id_to_remove = None
+    elif replied_user:
+        username = replied_user.username
+        user_id_to_remove = replied_user.id
     else:
-        username = update.message.reply_to_message.from_user.username.lstrip('@')
+        username = None
+        user_id_to_remove = None
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM authorized_users WHERE username = ?", (username,))
+    if user_id_to_remove is not None:
+        cursor.execute(
+            "DELETE FROM authorized_users WHERE user_id = ?",
+            (user_id_to_remove,),
+        )
+    else:
+        cursor.execute(
+            "DELETE FROM authorized_users WHERE username = ? COLLATE NOCASE",
+            (username,),
+        )
+    removed = cursor.rowcount
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(f"✅ User {username} has been removed.")
+    if removed:
+        display_name = f"@{username}" if username else f"ID {user_id_to_remove}"
+        await update.message.reply_text(f"✅ User {display_name} has been removed.")
+    else:
+        await update.message.reply_text("❌ Authorized user not found.")
 
 async def handle_file_upload(update: Update, context: CallbackContext) -> None:
-    user_id = update.message.from_user.id
-    if not is_user_authorized(user_id):
+    if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to upload files.")
         return
 
@@ -360,7 +498,7 @@ async def _send_pdf_with_retry(message, output_path, label):
 
 async def split_pdf(update: Update, context: CallbackContext, args=None, input_path=None):
     """Split the latest/replied PDF and send all generated files to Telegram."""
-    if not is_user_authorized(update.message.from_user.id):
+    if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to split files.")
         return
 
