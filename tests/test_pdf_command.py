@@ -1,14 +1,21 @@
+import asyncio
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 from types import SimpleNamespace
 
-from telegram.error import TimedOut
+import fitz
+from telegram.error import BadRequest, TimedOut
 
 from bot.utils import (
+    PDF_DOWNLOAD_LIMIT_BYTES,
     PDF_UPLOAD_ATTEMPTS,
     PDF_UPLOAD_WRITE_TIMEOUT,
+    PdfDownloadError,
+    SplitResult,
+    _PdfStatus,
+    _download_pdf_document,
     _duplex_from_args,
     _cached_replied_pdf,
     _find_replied_pdf_document,
@@ -16,6 +23,7 @@ from bot.utils import (
     _upload_file_path,
     handle_file_upload,
     _send_pdf_with_retry,
+    _split_pdf_with_progress,
     _splitpdf_caption_args,
     split_pdf,
 )
@@ -153,6 +161,343 @@ class PdfUploadRetryTests(unittest.IsolatedAsyncioTestCase):
                 )
 
 
+class PdfDownloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_large_file_without_mtproto_credentials_is_actionable(self):
+        document = SimpleNamespace(
+            file_id="large-file",
+            file_name="large.pdf",
+            file_size=PDF_DOWNLOAD_LIMIT_BYTES + 1,
+        )
+        context = SimpleNamespace(bot=SimpleNamespace(get_file=AsyncMock()))
+
+        with self.assertRaisesRegex(PdfDownloadError, "TELEGRAM_API_ID"):
+            await _download_pdf_document(context, document, 500, 42)
+
+        context.bot.get_file.assert_not_awaited()
+
+    async def test_known_large_file_uses_mtproto_with_progress(self):
+        with TemporaryDirectory() as tmp:
+            file_size = 30 * 1024 * 1024
+            document = SimpleNamespace(
+                file_id="large-file",
+                file_name="large.pdf",
+                file_size=file_size,
+            )
+            context = SimpleNamespace(
+                bot=SimpleNamespace(get_file=AsyncMock())
+            )
+            status = SimpleNamespace(update=AsyncMock(return_value=True))
+            downloader = SimpleNamespace(download=AsyncMock())
+
+            async def download(file_id, destination, progress):
+                self.assertEqual(file_id, "large-file")
+                Path(destination).write_bytes(b"%PDF large")
+                await progress(file_size // 2, 0)
+                return Path(destination)
+
+            downloader.download.side_effect = download
+            with (
+                patch("bot.utils.UPLOAD_DIR", tmp),
+                patch(
+                    "bot.utils._get_mtproto_downloader",
+                    return_value=downloader,
+                ),
+            ):
+                result = await _download_pdf_document(
+                    context,
+                    document,
+                    500,
+                    42,
+                    status=status,
+                )
+
+            self.assertEqual(result, str(Path(tmp, "500", "42", "large.pdf")))
+            self.assertTrue(Path(result).is_file())
+            context.bot.get_file.assert_not_awaited()
+            downloader.download.assert_awaited_once()
+            destination = downloader.download.await_args.args[1]
+            self.assertTrue(destination.is_absolute())
+            edits = [call.args[0] for call in status.update.await_args_list]
+            self.assertTrue(any("Preparing" in text for text in edits))
+            self.assertTrue(any("50%" in text for text in edits))
+
+    async def test_small_file_stays_on_hosted_bot_api(self):
+        with TemporaryDirectory() as tmp:
+            telegram_file = SimpleNamespace(download_to_drive=AsyncMock())
+            context = SimpleNamespace(
+                bot=SimpleNamespace(
+                    get_file=AsyncMock(return_value=telegram_file)
+                )
+            )
+            document = SimpleNamespace(
+                file_id="small-file",
+                file_name="small.pdf",
+                file_size=PDF_DOWNLOAD_LIMIT_BYTES,
+            )
+
+            with (
+                patch("bot.utils.UPLOAD_DIR", tmp),
+                patch("bot.utils._get_mtproto_downloader") as mtproto,
+            ):
+                result = await _download_pdf_document(
+                    context,
+                    document,
+                    500,
+                    42,
+                )
+
+            context.bot.get_file.assert_awaited_once_with("small-file")
+            telegram_file.download_to_drive.assert_awaited_once_with(result)
+            mtproto.assert_not_called()
+
+    async def test_unknown_size_cloud_rejection_retries_with_mtproto(self):
+        with TemporaryDirectory() as tmp:
+            async def fail_after_partial(path):
+                Path(path).write_bytes(b"partial")
+                raise BadRequest("File is too big")
+
+            telegram_file = SimpleNamespace(
+                download_to_drive=AsyncMock(side_effect=fail_after_partial)
+            )
+            context = SimpleNamespace(
+                bot=SimpleNamespace(
+                    get_file=AsyncMock(return_value=telegram_file)
+                )
+            )
+            document = SimpleNamespace(
+                file_id="large-file",
+                file_name="large.pdf",
+                file_size=None,
+            )
+            downloader = SimpleNamespace(download=AsyncMock())
+
+            async def mtproto_download(file_id, destination, progress):
+                self.assertEqual(file_id, "large-file")
+                Path(destination).write_bytes(b"%PDF recovered")
+                return Path(destination)
+
+            downloader.download.side_effect = mtproto_download
+
+            with (
+                patch("bot.utils.UPLOAD_DIR", tmp),
+                patch(
+                    "bot.utils._get_mtproto_downloader",
+                    return_value=downloader,
+                ),
+            ):
+                result = await _download_pdf_document(
+                    context,
+                    document,
+                    500,
+                    42,
+                )
+
+            self.assertEqual(Path(result).read_bytes(), b"%PDF recovered")
+            context.bot.get_file.assert_awaited_once_with("large-file")
+            downloader.download.assert_awaited_once()
+
+    async def test_cloud_rejection_without_credentials_removes_partial_file(self):
+        with TemporaryDirectory() as tmp:
+            async def fail_after_partial(path):
+                Path(path).write_bytes(b"partial")
+                raise BadRequest("File is too big")
+
+            telegram_file = SimpleNamespace(
+                download_to_drive=AsyncMock(side_effect=fail_after_partial)
+            )
+            context = SimpleNamespace(
+                bot=SimpleNamespace(
+                    get_file=AsyncMock(return_value=telegram_file)
+                )
+            )
+            document = SimpleNamespace(
+                file_id="large-file",
+                file_name="large.pdf",
+                file_size=None,
+            )
+
+            with (
+                patch("bot.utils.UPLOAD_DIR", tmp),
+                self.assertRaisesRegex(PdfDownloadError, "TELEGRAM_API_HASH"),
+            ):
+                await _download_pdf_document(context, document, 500, 42)
+
+            self.assertFalse(Path(tmp, "500", "42", "large.pdf").exists())
+
+
+class PdfStatusTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forced_status_edit_retries_network_error_without_raising(self):
+        message = SimpleNamespace(
+            message_id=10,
+            edit_text=AsyncMock(
+                side_effect=[TimedOut("temporary timeout"), None]
+            ),
+        )
+        status = _PdfStatus(message=message)
+
+        with patch("bot.utils.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            updated = await status.update("Still working", force=True)
+
+        self.assertTrue(updated)
+        self.assertEqual(message.edit_text.await_count, 2)
+        sleep.assert_awaited_once_with(1)
+
+    async def test_status_text_is_limited_to_telegram_message_length(self):
+        message = SimpleNamespace(message_id=10, edit_text=AsyncMock())
+        status = _PdfStatus(message=message)
+
+        await status.update("x" * 5000, force=True)
+
+        self.assertEqual(len(message.edit_text.await_args.args[0]), 4096)
+
+
+class PdfProgressWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def update(message, chat_id=500):
+        return SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=chat_id),
+        )
+
+    async def test_caption_flow_uses_one_status_for_every_stage(self):
+        status_message = SimpleNamespace(
+            message_id=700,
+            edit_text=AsyncMock(),
+        )
+        document = SimpleNamespace(
+            file_id="pdf-file-id",
+            file_name="main.pdf",
+            mime_type="application/pdf",
+            file_size=654_900,
+        )
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=100, username="user"),
+            message_id=43,
+            document=document,
+            caption="/splitpdf --duplex",
+            reply_to_message=None,
+            external_reply=None,
+            reply_text=AsyncMock(return_value=status_message),
+            reply_document=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            bot=SimpleNamespace(),
+            user_data={},
+            chat_data={},
+        )
+        result = SplitResult(
+            bw_path=Path("/tmp/main_BW.pdf"),
+            color_path=Path("/tmp/main_Color.pdf"),
+            bw_pages=3,
+            color_pages=1,
+            guide="Manual printing guide\n" + ("detail\n" * 1000),
+        )
+
+        with (
+            patch("bot.utils.is_user_authorized", return_value=True),
+            patch(
+                "bot.utils._download_pdf_document",
+                new_callable=AsyncMock,
+                return_value="uploads/500/43/main.pdf",
+            ),
+            patch(
+                "bot.utils._split_pdf_with_progress",
+                new_callable=AsyncMock,
+                return_value=result,
+            ),
+            patch(
+                "bot.utils._send_pdf_with_retry",
+                new_callable=AsyncMock,
+            ) as send_pdf,
+        ):
+            await handle_file_upload(self.update(message), context)
+
+        message.reply_text.assert_awaited_once()
+        self.assertIn(
+            "Downloading selected PDF",
+            message.reply_text.await_args.args[0],
+        )
+        edits = [call.args[0] for call in status_message.edit_text.await_args_list]
+        self.assertTrue(any("Splitting PDF" in text for text in edits))
+        self.assertTrue(any("Uploading B&W pages" in text for text in edits))
+        self.assertTrue(any("Uploading Color pages" in text for text in edits))
+        self.assertIn("PDF split complete", edits[-1])
+        self.assertIn("Mode: Duplex", edits[-1])
+        self.assertIn("B&W pages: 3", edits[-1])
+        self.assertIn("Color pages: 1", edits[-1])
+        self.assertIn("Manual printing guide", edits[-1])
+        self.assertLessEqual(len(edits[-1]), 4096)
+        self.assertEqual(send_pdf.await_count, 2)
+
+    async def test_oversize_caption_shows_mtproto_setup_in_same_status(self):
+        status_message = SimpleNamespace(
+            message_id=700,
+            edit_text=AsyncMock(),
+        )
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=100, username="user"),
+            message_id=43,
+            document=SimpleNamespace(
+                file_id="large-file-id",
+                file_name="large.pdf",
+                mime_type="application/pdf",
+                file_size=PDF_DOWNLOAD_LIMIT_BYTES + 1,
+            ),
+            caption="/splitpdf",
+            reply_to_message=None,
+            reply_text=AsyncMock(return_value=status_message),
+        )
+        context = SimpleNamespace(
+            bot=SimpleNamespace(get_file=AsyncMock()),
+            user_data={},
+            chat_data={},
+        )
+
+        with (
+            patch("bot.utils.is_user_authorized", return_value=True),
+            patch("bot.utils.split_pdf", new_callable=AsyncMock) as split,
+        ):
+            await handle_file_upload(self.update(message), context)
+
+        message.reply_text.assert_awaited_once()
+        context.bot.get_file.assert_not_awaited()
+        split.assert_not_awaited()
+        self.assertIn(
+            "TELEGRAM_API_ID",
+            status_message.edit_text.await_args.args[0],
+        )
+        self.assertEqual(context.chat_data, {})
+
+    async def test_real_split_worker_reports_without_thread_deadlock(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            document = fitz.open()
+            document.new_page()
+            document.save(source)
+            document.close()
+            status_message = SimpleNamespace(
+                message_id=700,
+                edit_text=AsyncMock(),
+            )
+            status = _PdfStatus(message=status_message)
+
+            with patch("bot.utils.PDF_STATUS_EDIT_INTERVAL", 0):
+                result = await asyncio.wait_for(
+                    _split_pdf_with_progress(
+                        source,
+                        False,
+                        root / "out",
+                        status,
+                    ),
+                    timeout=10,
+                )
+
+            self.assertEqual(result.bw_pages, 1)
+            self.assertTrue(result.bw_path.is_file())
+
+
 class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def update(message, chat_id=500):
@@ -163,7 +508,10 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_missing_replied_file_starts_pending_duplex_upload(self):
-        prompt_message = SimpleNamespace(message_id=700)
+        prompt_message = SimpleNamespace(
+            message_id=700,
+            edit_text=AsyncMock(),
+        )
         message = SimpleNamespace(
             from_user=SimpleNamespace(id=100, username="user"),
             reply_to_message=SimpleNamespace(),
@@ -198,7 +546,10 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 "prompt_message_id": 700,
             },
         )
-        prompt = message.reply_text.await_args.args[0]
+        message.reply_text.assert_awaited_once_with(
+            "🔎 Locating the selected PDF…"
+        )
+        prompt = prompt_message.edit_text.await_args.args[0]
         self.assertIn("Reply directly to this bot message", prompt)
 
     async def test_next_pdf_is_automatically_split_with_pending_args(self):
@@ -218,6 +569,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
         context = SimpleNamespace(
             bot=SimpleNamespace(
                 get_file=AsyncMock(return_value=telegram_file),
+                edit_message_text=AsyncMock(),
             ),
             user_data={
                 "pending_pdf_split": {
@@ -244,11 +596,20 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
             context,
             args=["--duplex"],
             input_path="uploads/500/43/main.pdf",
+            status=ANY,
+        )
+        context.bot.edit_message_text.assert_awaited_once()
+        self.assertIn(
+            "Downloading selected PDF",
+            context.bot.edit_message_text.await_args.kwargs["text"],
         )
         self.assertNotIn("pending_pdf_split", context.user_data)
 
     async def test_explicit_group_reply_never_uses_private_last_upload(self):
-        prompt_message = SimpleNamespace(message_id=701)
+        prompt_message = SimpleNamespace(
+            message_id=701,
+            edit_text=AsyncMock(),
+        )
         message = SimpleNamespace(
             from_user=SimpleNamespace(id=100, username="user"),
             message_id=44,
@@ -285,7 +646,10 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await split_pdf(self.update(message, chat_id=-500), context)
 
         self.assertIn("pending_pdf_split", context.user_data)
-        prompt = message.reply_text.await_args.args[0]
+        message.reply_text.assert_awaited_once_with(
+            "🔎 Locating the selected PDF…"
+        )
+        prompt = prompt_message.edit_text.await_args.args[0]
         self.assertIn("No downloadable PDF was selected", prompt)
 
     async def test_ordinary_group_document_is_completely_ignored(self):

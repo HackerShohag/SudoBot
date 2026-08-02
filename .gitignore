@@ -3,6 +3,8 @@ db/*
 
 # python chache
 __pycache__
+venv/
+.venv/
 
 # junk scipts
 sh/*

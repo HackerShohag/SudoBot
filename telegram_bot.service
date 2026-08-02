@@ -1,17 +1,19 @@
 [Unit]
-Description=Telegram Bot Service
-After=network.target
+Description=SudoBot Telegram Service
+Wants=network-online.target
+After=network-online.target
 
 [Service]
-Environment=BOT_PATH=/home/shohag/Projects/junk/Bots/Telegram
-ExecStartPre=/bin/sleep 60
-ExecStart=/usr/bin/python3 /home/shohag/Projects/junk/Bots/Telegram/main.py
-Restart=always
-User=shohag
-WorkingDirectory=/home/shohag/Projects/junk/Bots/Telegram
-StandardOutput=append:/home/shohag/Projects/junk/Bots/Telegram/log/bot_log.log
-StandardError=append:/home/shohag/Projects/junk/Bots/Telegram/log/bot_log_err.log
+Type=simple
+User=__BOT_USER__
+WorkingDirectory=__BOT_PATH__
+Environment=PYTHONUNBUFFERED=1
+ExecStart="__BOT_PATH__/venv/bin/python" "__BOT_PATH__/main.py"
+Restart=on-failure
+RestartSec=5
+UMask=0077
+StandardOutput=append:__BOT_PATH__/log/bot_log.log
+StandardError=append:__BOT_PATH__/log/bot_log_err.log
 
 [Install]
 WantedBy=multi-user.target
-

@@ -1,95 +1,440 @@
 import asyncio
+from dataclasses import dataclass, field
+import logging
+import re
+import shlex
 from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler, CallbackContext
-from telegram.error import RetryAfter
-from bot.keyboard import update_command_history, update_keyboard
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
+from bot.keyboard import update_command_history
 from bot.utils import is_super_admin
 from bot.config import MAX_CHARS
 import signal
-import subprocess
 import os
 
 AWAITING_SUDO_PASSWORD = 1
 running_process = None
 UPLOAD_DIR = "uploads"
 
-async def execute_command(command: str, update, context, reply_to_message_id):
-    global running_process
+logger = logging.getLogger(__name__)
+
+# Telegram permits at most 4,096 characters in a text message.  Keep a small
+# character-count safety margin. Four seconds is frequent enough to make a
+# command feel alive without approaching Telegram's per-chat edit limits.
+TELEGRAM_SAFE_MESSAGE_LIMIT = 4000
+STATUS_EDIT_INTERVAL = 4.0
+OUTPUT_TAIL_CHARS = 32_768
+SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+
+
+def _message_limit() -> int:
+    try:
+        configured_limit = int(MAX_CHARS)
+    except (TypeError, ValueError):
+        configured_limit = 4096
+    return max(512, min(configured_limit, TELEGRAM_SAFE_MESSAGE_LIMIT))
+
+
+def _safe_output(text: str) -> str:
+    """Make arbitrary process output safe for a plain Telegram text message."""
+    text = ANSI_ESCAPE_RE.sub("", text)
+    return "".join(
+        character
+        if character in "\n\t" or ord(character) >= 32
+        else "�"
+        for character in text
+    )
+
+
+def _limit_message(text: str) -> str:
+    limit = _message_limit()
+    if len(text) <= limit:
+        return text
+
+    marker = "\n\n… message shortened …\n\n"
+    head_size = min(320, (limit - len(marker)) // 3)
+    tail_size = limit - head_size - len(marker)
+    return f"{text[:head_size]}{marker}{text[-tail_size:]}"
+
+
+def _retry_after_seconds(value) -> float:
+    if hasattr(value, "total_seconds"):
+        value = value.total_seconds()
+    try:
+        return max(float(value), 0.1)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+@dataclass
+class _OutputBuffer:
+    tail: str = ""
+    total_chars: int = 0
+
+    def append(self, value) -> None:
+        if not value:
+            return
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        else:
+            value = str(value)
+        value = _safe_output(value)
+        self.total_chars += len(value)
+        self.tail = (self.tail + value)[-OUTPUT_TAIL_CHARS:]
+
+
+@dataclass
+class _StatusMessage:
+    message: object
+    last_text: str
+
+
+@dataclass
+class _ActiveCommand:
+    process: object
+    status: _StatusMessage
+    started_at: float
+    subject: str = "Command"
+    stdout: _OutputBuffer = field(default_factory=_OutputBuffer)
+    stderr: _OutputBuffer = field(default_factory=_OutputBuffer)
+    stop_requested: bool = False
+
+
+_active_command = None
+_command_starting = False
+
+
+async def _send_status(update, text: str, reply_to_message_id) -> _StatusMessage:
+    text = _limit_message(text)
+    message = await update.message.reply_text(
+        text,
+        reply_to_message_id=reply_to_message_id,
+    )
+    return _StatusMessage(message=message, last_text=text)
+
+
+async def _edit_status(status: _StatusMessage, text: str) -> bool:
+    """Edit one status message, respecting flood control and transient failures."""
+    text = _limit_message(text)
+    if text == status.last_text:
+        return True
+
+    network_attempts = 0
+    while True:
+        try:
+            await status.message.edit_text(text)
+        except RetryAfter as exc:
+            await asyncio.sleep(_retry_after_seconds(exc.retry_after))
+            continue
+        except BadRequest as exc:
+            # A timed-out edit may have succeeded at Telegram.  Retrying it can
+            # legitimately produce this response, which is equivalent to success.
+            if "message is not modified" in str(exc).casefold():
+                status.last_text = text
+                return True
+            logger.warning("Could not edit command status: %s", exc)
+            return False
+        except NetworkError as exc:
+            if network_attempts < 1:
+                network_attempts += 1
+                await asyncio.sleep(1)
+                continue
+            logger.warning("Could not edit command status after retry: %s", exc)
+            return False
+        except TelegramError as exc:
+            logger.warning("Could not edit command status: %s", exc)
+            return False
+        else:
+            status.last_text = text
+            return True
+
+
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _render_stream(label: str, output: _OutputBuffer, limit: int) -> str:
+    prefix = f"{label}:\n"
+    available = max(1, limit - len(prefix))
+
+    if output.total_chars == 0:
+        return f"{prefix}(no output)"
+
+    value = output.tail.rstrip("\n") or "(whitespace only)"
+    if len(value) <= available and output.total_chars <= len(output.tail):
+        return f"{prefix}{value}"
+
+    marker = "… earlier output omitted …\n"
+    tail_size = max(1, available - len(marker))
+    return f"{prefix}{marker}{value[-tail_size:]}"
+
+
+def _render_streams(
+    stdout: _OutputBuffer,
+    stderr: _OutputBuffer,
+    budget: int,
+    *,
+    include_empty: bool,
+) -> str:
+    streams = [("stdout", stdout), ("stderr", stderr)]
+    if not include_empty:
+        streams = [(label, output) for label, output in streams if output.total_chars]
+        if not streams:
+            return "Waiting for output…"
+
+    separator_size = 2 * (len(streams) - 1)
+    per_stream = max(40, (budget - separator_size) // len(streams))
+    rendered = [
+        _render_stream(label, output, per_stream) for label, output in streams
+    ]
+    return "\n\n".join(rendered)
+
+
+def _running_text(active: _ActiveCommand, elapsed: float, frame: int) -> str:
+    subject = active.subject.casefold()
+    if active.stop_requested:
+        title = f"🛑 Stopping {subject}…"
+    else:
+        title = (
+            f"{SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]} "
+            f"Running {subject}…"
+        )
+    header = f"{title}\nElapsed: {_format_elapsed(elapsed)}"
+    budget = _message_limit() - len(header) - 2
+    output = _render_streams(
+        active.stdout,
+        active.stderr,
+        budget,
+        include_empty=False,
+    )
+    return _limit_message(f"{header}\n\n{output}")
+
+
+def _final_text(
+    stdout: _OutputBuffer,
+    stderr: _OutputBuffer,
+    return_code: int,
+    elapsed: float,
+    *,
+    stopped: bool,
+    subject: str = "Command",
+) -> str:
+    if stopped:
+        title = f"🛑 {subject} stopped"
+    elif return_code == 0:
+        title = f"✅ {subject} completed"
+    else:
+        title = f"❌ {subject} failed"
+
+    header = (
+        f"{title}\n"
+        f"Exit code: {return_code}\n"
+        f"Elapsed: {_format_elapsed(elapsed)}\n"
+        f"Captured: {stdout.total_chars} stdout / {stderr.total_chars} stderr chars"
+    )
+    budget = _message_limit() - len(header) - 2
+    output = _render_streams(
+        stdout,
+        stderr,
+        budget,
+        include_empty=True,
+    )
+    return _limit_message(f"{header}\n\n{output}")
+
+
+async def _drain_stream(stream, output: _OutputBuffer) -> None:
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            return
+        output.append(chunk)
+
+
+def _signal_process(process, process_signal) -> None:
+    """Signal the command's process group, falling back to the shell process."""
+    process_id = getattr(process, "pid", None)
+    if process_id is not None:
+        try:
+            os.killpg(process_id, process_signal)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            # The fallback also keeps light-weight process doubles usable in tests.
+            pass
+    process.send_signal(process_signal)
+
+
+async def _terminate_process(process) -> None:
+    if process is None or process.returncode is not None:
+        return
+    try:
+        _signal_process(process, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        try:
+            _signal_process(process, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        await process.wait()
+
+async def execute_command(
+    command: str,
+    update,
+    context,
+    reply_to_message_id,
+    *,
+    subject: str = "Command",
+):
+    global running_process, _active_command, _command_starting
     if not is_super_admin(update.message.from_user):
         await update.message.reply_text(
             "❌ Only the super admin can run host commands."
         )
         return
 
-    running_process = await asyncio.create_subprocess_shell(
-        command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
+    if _command_starting or _active_command is not None or (
+        running_process is not None and running_process.returncode is None
+    ):
+        await update.message.reply_text(
+            "⚠️ Another host command is already running. Stop it with /stop first.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
 
-    update_command_history(update, context)
+    # Set this before the first await so two updates arriving together cannot
+    # both pass the availability check and overwrite the global process handle.
+    _command_starting = True
+    status = None
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    process = None
+    wait_task = None
+    drain_tasks = []
+    active = None
 
-    message = await context.bot.send_message(
-        chat_id=update.message.chat_id,
-        text="Running command...",
-        reply_to_message_id=reply_to_message_id
-    )
+    try:
+        status = await _send_status(
+            update,
+            (
+                f"⠋ Running {subject.casefold()}…\n"
+                "Elapsed: 0s\n\n"
+                "Waiting for output…"
+            ),
+            reply_to_message_id,
+        )
+        process = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        running_process = process
+        active = _ActiveCommand(
+            process=process,
+            status=status,
+            started_at=started_at,
+            subject=subject,
+        )
+        _active_command = active
+        _command_starting = False
 
-    output_lines = []
-    max_chars = 4000
-    last_edit_time = asyncio.get_event_loop().time()  # Track last edit time
+        try:
+            update_command_history(update, context)
+        except Exception as exc:
+            # Command history is a convenience and must never prevent execution.
+            logger.warning("Could not update command history: %s", exc)
 
-    async for line in running_process.stdout:
-        output_lines.append(line.decode().strip())
-        output_text = "\n".join(output_lines)  # Last 20 lines
+        drain_tasks = [
+            asyncio.create_task(_drain_stream(process.stdout, active.stdout)),
+            asyncio.create_task(_drain_stream(process.stderr, active.stderr)),
+        ]
+        wait_task = asyncio.create_task(process.wait())
+        frame = 0
 
-        if not output_text:
-            output_text = "The command has no output."
-
-        if len(output_text) > max_chars:
-            await context.bot.edit_message_text(
-                chat_id=update.message.chat_id,
-                message_id=message.message_id,
-                text="Output too long! Sending full output in separate messages...",
-                parse_mode='MarkdownV2'
-            )
-            await send_large_output(update, context, output_lines, reply_to_message_id)
-            return
-
-        new_text = f"```\n{output_text}\n```"
-
-        # Limit message edits to avoid flood control
-        if message.text != new_text and (asyncio.get_event_loop().time() - last_edit_time > 3):  # Edit every 3 seconds
+        while not wait_task.done():
             try:
-                await context.bot.edit_message_text(
-                    chat_id=update.message.chat_id,
-                    message_id=message.message_id,
-                    text=new_text,
-                    parse_mode='MarkdownV2'
+                await asyncio.wait_for(
+                    asyncio.shield(wait_task),
+                    timeout=STATUS_EDIT_INTERVAL,
                 )
-                last_edit_time = asyncio.get_event_loop().time()  # Update last edit time
-            except RetryAfter as e:
-                await asyncio.sleep(e.retry_after)  # Wait if Telegram blocks edits
+            except asyncio.TimeoutError:
+                frame += 1
+                elapsed = loop.time() - started_at
+                await _edit_status(status, _running_text(active, elapsed, frame))
 
-    err = await running_process.stderr.read()
-    if err:
-        output_lines.append(f"\nError:\n{err.decode().strip()}")
-        await context.bot.edit_message_text(
-            chat_id=update.message.chat_id,
-            message_id=message.message_id,
-            text=f"```\n{output_text}\n\nError:\n{err.decode().strip()}\n```",
-            parse_mode='MarkdownV2'
+        return_code = await wait_task
+        drain_results = await asyncio.gather(*drain_tasks, return_exceptions=True)
+        for stream_name, result in zip(("stdout", "stderr"), drain_results):
+            if isinstance(result, Exception):
+                active.stderr.append(f"\n[{stream_name} read failed: {result}]\n")
+
+        elapsed = loop.time() - started_at
+        await _edit_status(
+            status,
+            _final_text(
+                active.stdout,
+                active.stderr,
+                return_code,
+                elapsed,
+                stopped=active.stop_requested,
+                subject=subject,
+            ),
         )
-    else:
-        await context.bot.edit_message_text(
-            chat_id=update.message.chat_id,
-            message_id=message.message_id,
-            text=f"```\n{output_text}\n```",
-            parse_mode='MarkdownV2'
-        )
-
-    await running_process.wait()
-    running_process = None
-
-    await update_keyboard(update, context)
+    except asyncio.CancelledError:
+        await _terminate_process(process)
+        raise
+    except Exception as exc:
+        logger.exception("Command execution failed")
+        await _terminate_process(process)
+        elapsed = loop.time() - started_at
+        error_output = _OutputBuffer()
+        error_output.append(str(exc))
+        if status is not None:
+            await _edit_status(
+                status,
+                _final_text(
+                    _OutputBuffer(),
+                    error_output,
+                    -1,
+                    elapsed,
+                    stopped=False,
+                    subject=subject,
+                ),
+            )
+    finally:
+        if wait_task is not None and not wait_task.done():
+            wait_task.cancel()
+        for task in drain_tasks:
+            if not task.done():
+                task.cancel()
+        if wait_task is not None or drain_tasks:
+            await asyncio.gather(
+                *([wait_task] if wait_task is not None else []),
+                *drain_tasks,
+                return_exceptions=True,
+            )
+        try:
+            await _terminate_process(process)
+        finally:
+            # Never leave a stale global behind, even if process cleanup itself
+            # encounters an unexpected platform-level error.
+            if running_process is process:
+                running_process = None
+            if _active_command is active:
+                _active_command = None
+            _command_starting = False
 
 async def execute_on_file(update: Update, context: CallbackContext) -> None:
     if not is_super_admin(update.message.from_user):
@@ -111,44 +456,15 @@ async def execute_on_file(update: Update, context: CallbackContext) -> None:
         return
 
     # Replace `{file}` with the actual file path
-    command = command.replace("{file}", f"'{file_path}'")
+    command = command.replace("{file}", shlex.quote(file_path))
 
-    try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
-
-        if result.returncode == 0:
-            await update.message.reply_text(f"✅ Command executed successfully!\n```\n{result.stdout}\n```", parse_mode="MarkdownV2")
-        else:
-            await update.message.reply_text(f"❌ Command failed:\n```\n{result.stderr}\n```", parse_mode="MarkdownV2")
-
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Error executing command: `{str(e)}`", parse_mode="MarkdownV2")
-
-async def send_large_output(update: Update, context: ContextTypes.DEFAULT_TYPE, output_lines, reply_to_message_id):
-    """Splits large command output into multiple messages to prevent errors."""
-    chunk = "```\n"
-
-    for line in output_lines:
-        if len(chunk) + len(line) > int(MAX_CHARS) - 4:  # Adjust for the length of the backticks
-            chunk += "```"
-            await context.bot.send_message(
-                chat_id=update.message.chat_id,
-                text=chunk,
-                reply_to_message_id=reply_to_message_id,
-                parse_mode='MarkdownV2'
-            )
-            chunk = f"```\n{line}\n"
-        else:
-            chunk += line + "\n"
-
-    if chunk.strip() != "```":
-        chunk += "```"
-        await context.bot.send_message(
-            chat_id=update.message.chat_id,
-            text=chunk,
-            reply_to_message_id=reply_to_message_id,
-            parse_mode='MarkdownV2'
-        )
+    await execute_command(
+        command,
+        update,
+        context,
+        update.message.message_id,
+        subject="File command",
+    )
 
 async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_super_admin(update.message.from_user):
@@ -201,7 +517,7 @@ async def password_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global running_process
+    global running_process, _active_command
     if not is_super_admin(update.message.from_user):
         await update.message.reply_text(
             "❌ Only the super admin can stop host commands."
@@ -209,13 +525,24 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if running_process and running_process.returncode is None:
-        running_process.send_signal(signal.SIGTERM)  # Send SIGTERM instead of terminate()
+        process = running_process
+        active = _active_command
+        if active is not None and active.process is process:
+            active.stop_requested = True
         try:
-            await asyncio.wait_for(running_process.wait(), timeout=5)  # Give it time to exit
+            _signal_process(process, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
         except asyncio.TimeoutError:
-            running_process.kill()  # Force kill if it does not stop
-        running_process = None  # Reset process reference
-        await update.message.reply_text("✅ Command execution stopped.")
-        await update_keyboard(update, context)
+            try:
+                _signal_process(process, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            else:
+                await process.wait()
+        # execute_command owns the status message and will turn it into the final
+        # stopped result.  Avoid emitting a second completion message here.
     else:
         await update.message.reply_text("⚠️ No command is currently running.")

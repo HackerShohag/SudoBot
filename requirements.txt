@@ -1,4 +1,6 @@
 python-telegram-bot==22.6
+# Maintained MTProto client; the Python import namespace is `pyrogram`.
+kurigram==2.2.24
 python-dotenv==1.0.1
 gputil==1.4.0
 psutil==7.2.2

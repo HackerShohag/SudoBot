@@ -1,8 +1,14 @@
-from telegram import KeyboardButton, ReplyKeyboardMarkup
+import atexit
 import sqlite3
+from pathlib import Path
+
+from telegram import KeyboardButton, ReplyKeyboardMarkup
 
 # Initialize the database connection
-conn = sqlite3.connect('db/commands_history.db')
+COMMAND_HISTORY_DB_PATH = Path("db/commands_history.db")
+COMMAND_HISTORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+conn = sqlite3.connect(COMMAND_HISTORY_DB_PATH)
+atexit.register(conn.close)
 cursor = conn.cursor()
 
 # Function to create a user-specific table if it doesn't exist

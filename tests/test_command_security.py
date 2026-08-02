@@ -59,11 +59,14 @@ class HostCommandSecurityTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("bot.bot.is_super_admin", return_value=False),
-            patch("bot.bot.subprocess.run") as subprocess_run,
+            patch(
+                "bot.bot.asyncio.create_subprocess_shell",
+                new_callable=AsyncMock,
+            ) as create_process,
         ):
             await execute_on_file(update, context)
 
-        subprocess_run.assert_not_called()
+        create_process.assert_not_awaited()
 
     async def test_super_admin_run_reaches_guarded_executor(self):
         update = command_update("HackerShohag")
@@ -77,19 +80,24 @@ class HostCommandSecurityTests(unittest.IsolatedAsyncioTestCase):
 
         execute.assert_awaited_once_with("whoami", update, context, 10)
 
-    async def test_super_admin_runfile_reaches_subprocess(self):
+    async def test_super_admin_runfile_reaches_guarded_async_executor(self):
         update = command_update("HackerShohag")
         context = SimpleNamespace(args=["file.txt", "cat", "{file}"])
-        result = SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
         with (
             patch("bot.bot.is_super_admin", return_value=True),
             patch("bot.bot.os.path.exists", return_value=True),
-            patch("bot.bot.subprocess.run", return_value=result) as run,
+            patch("bot.bot.execute_command", new_callable=AsyncMock) as execute,
         ):
             await execute_on_file(update, context)
 
-        run.assert_called_once()
+        execute.assert_awaited_once_with(
+            "cat uploads/file.txt",
+            update,
+            context,
+            10,
+            subject="File command",
+        )
 
     async def test_password_continuation_rejects_non_super_admin(self):
         update = command_update()

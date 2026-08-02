@@ -61,6 +61,26 @@ class PdfSplittingTests(unittest.TestCase):
             self.assertEqual(result.color_pages, 1)
             self.assertTrue(result.color_path.is_file())
 
+    def test_reports_page_progress_during_split(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "mixed.pdf"
+            self.make_pdf(source, [(0, 0, 0), (1, 0, 0), (0, 0, 0)])
+            progress = []
+
+            split_for_manual_color(
+                source,
+                output_dir=root / "out",
+                progress_callback=lambda processed, total: progress.append(
+                    (processed, total)
+                ),
+            )
+
+            self.assertEqual(
+                progress,
+                [(0, 3), (1, 3), (2, 3), (3, 3)],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

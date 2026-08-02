@@ -1,21 +1,34 @@
 import sqlite3
-import subprocess
 import asyncio
+import logging
+import multiprocessing
+import queue
 import shlex
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Optional
 
 from telegram import Update
 from telegram.ext import ContextTypes, CallbackContext
 from telegram.error import NetworkError, RetryAfter, TelegramError
-import re
 from pathlib import Path
 
 import fitz
 from PIL import Image, ImageChops
 
-from bot.config import SUPER_ADMIN_USERNAME
+from bot.config import (
+    BOT_TOKEN,
+    SUPER_ADMIN_USERNAME,
+    TELEGRAM_API_HASH,
+    TELEGRAM_API_ID,
+)
+from bot.mtproto import (
+    MtprotoConfigurationError,
+    MtprotoDependencyError,
+    MtprotoDownloader,
+    MtprotoError,
+)
 
 UPLOAD_DIR = "uploads"
 DB_PATH = "db/authorized_users.db"
@@ -24,6 +37,11 @@ PDF_UPLOAD_READ_TIMEOUT = 120
 PDF_UPLOAD_WRITE_TIMEOUT = 300
 PDF_UPLOAD_CONNECT_TIMEOUT = 30
 PDF_UPLOAD_POOL_TIMEOUT = 30
+PDF_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
+PDF_STATUS_EDIT_INTERVAL = 2.0
+
+logger = logging.getLogger(__name__)
+_mtproto_downloader = None
 
 
 @dataclass(frozen=True)
@@ -33,6 +51,200 @@ class SplitResult:
     bw_pages: int
     color_pages: int
     guide: str
+
+
+class PdfDownloadError(Exception):
+    """A selected PDF could not be downloaded from Telegram."""
+
+
+class _PdfStatus:
+    """Best-effort editor for the one status message used by a PDF job."""
+
+    def __init__(
+        self,
+        *,
+        message=None,
+        bot=None,
+        chat_id=None,
+        message_id=None,
+        initial_text=None,
+    ):
+        self._message = message
+        self._bot = bot
+        self.chat_id = chat_id
+        self.message_id = message_id or getattr(message, "message_id", None)
+        self._last_text = initial_text
+        self._last_edit = time.monotonic() if initial_text else 0.0
+        self._lock = asyncio.Lock()
+
+    async def update(self, text, *, force=False):
+        """Edit the status without allowing edit failures to stop the job."""
+        text = str(text)[:4096]
+        async with self._lock:
+            if text == self._last_text:
+                return True
+            if (
+                not force
+                and time.monotonic() - self._last_edit
+                < PDF_STATUS_EDIT_INTERVAL
+            ):
+                return False
+
+            for attempt in range(2 if force else 1):
+                try:
+                    if callable(getattr(self._message, "edit_text", None)):
+                        await self._message.edit_text(text)
+                    elif (
+                        self._bot is not None
+                        and callable(
+                            getattr(self._bot, "edit_message_text", None)
+                        )
+                        and self.chat_id is not None
+                        and self.message_id is not None
+                    ):
+                        await self._bot.edit_message_text(
+                            chat_id=self.chat_id,
+                            message_id=self.message_id,
+                            text=text,
+                        )
+                    else:
+                        return False
+                    self._last_text = text
+                    self._last_edit = time.monotonic()
+                    return True
+                except RetryAfter as exc:
+                    if attempt or not force:
+                        return False
+                    retry_after = exc.retry_after
+                    delay = (
+                        retry_after.total_seconds()
+                        if hasattr(retry_after, "total_seconds")
+                        else float(retry_after)
+                    )
+                    await asyncio.sleep(delay + 0.1)
+                except NetworkError:
+                    if attempt or not force:
+                        return False
+                    await asyncio.sleep(1)
+                except TelegramError:
+                    return False
+                except Exception:
+                    return False
+        return False
+
+
+async def _new_pdf_status(message, context, text):
+    sent = await message.reply_text(text[:4096])
+    return _PdfStatus(
+        message=sent,
+        bot=getattr(context, "bot", None),
+        chat_id=getattr(getattr(message, "chat", None), "id", None),
+        message_id=getattr(sent, "message_id", None),
+        initial_text=text[:4096],
+    )
+
+
+def _pending_pdf_status(context, pending_split):
+    return _PdfStatus(
+        bot=getattr(context, "bot", None),
+        chat_id=pending_split.get("chat_id"),
+        message_id=pending_split.get("prompt_message_id"),
+    )
+
+
+def _human_file_size(size):
+    if not isinstance(size, (int, float)) or size < 0:
+        return None
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return None
+
+
+def _download_status_text(document):
+    size = _human_file_size(getattr(document, "file_size", None))
+    size_text = f" ({size})" if size else ""
+    return f"⬇️ Downloading selected PDF{size_text}…"
+
+
+def _requires_mtproto_download(document):
+    file_size = getattr(document, "file_size", None)
+    return (
+        isinstance(file_size, (int, float))
+        and file_size > PDF_DOWNLOAD_LIMIT_BYTES
+    )
+
+
+def _get_mtproto_downloader():
+    """Return the one download-only MTProto client shared by this process."""
+    global _mtproto_downloader
+    if _mtproto_downloader is None:
+        _mtproto_downloader = MtprotoDownloader(
+            api_id=TELEGRAM_API_ID,
+            api_hash=TELEGRAM_API_HASH,
+            bot_token=BOT_TOKEN,
+        )
+    return _mtproto_downloader
+
+
+async def close_mtproto_downloader():
+    """Best-effort shutdown for the optional in-process MTProto client."""
+    global _mtproto_downloader
+    downloader = _mtproto_downloader
+    _mtproto_downloader = None
+    if downloader is None:
+        return
+    try:
+        await downloader.close()
+    except MtprotoError:
+        logger.warning(
+            "Could not close the MTProto large-file client cleanly",
+            exc_info=True,
+        )
+
+
+def _large_download_setup_error(document, detail):
+    size = _human_file_size(getattr(document, "file_size", None))
+    size_text = f" ({size})" if size else ""
+    return PdfDownloadError(
+        f"❌ Automatic large-file download{size_text} is unavailable: "
+        f"{detail}\n\n"
+        "Set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env, install "
+        "requirements.txt, and restart the bot."
+    )
+
+
+def _large_download_progress_text(document, current, reported_total):
+    configured_total = getattr(document, "file_size", None)
+    total = (
+        configured_total
+        if isinstance(configured_total, (int, float)) and configured_total > 0
+        else reported_total
+    )
+    if isinstance(total, (int, float)) and total > 0:
+        current = min(max(current, 0), total)
+        percent = round((current / total) * 100)
+        return (
+            "⬇️ Downloading large PDF: "
+            f"{_human_file_size(current)} / {_human_file_size(total)} "
+            f"({percent}%)…"
+        )
+    return f"⬇️ Downloading large PDF: {_human_file_size(current)}…"
+
+
+def _split_completion_text(result, duplex):
+    summary = (
+        "✅ PDF split complete.\n"
+        f"Mode: {'Duplex' if duplex else 'Simplex'}\n"
+        f"B&W pages: {result.bw_pages}\n"
+        f"Color pages: {result.color_pages}"
+    )
+    detail_prefix = "\n\nPrinting guide:\n"
+    available = 4096 - len(summary) - len(detail_prefix)
+    guide = result.guide[:available]
+    return f"{summary}{detail_prefix}{guide}"
 
 
 def is_color_page(page):
@@ -49,7 +261,12 @@ def is_color_page(page):
     return red_green_diff != (0, 0) or green_blue_diff != (0, 0)
 
 
-def split_for_manual_color(input_path, duplex=False, output_dir=None):
+def split_for_manual_color(
+    input_path,
+    duplex=False,
+    output_dir=None,
+    progress_callback=None,
+):
     """Split a PDF into B&W/color outputs for manual hybrid printing."""
     input_path = Path(input_path)
     if not input_path.is_file():
@@ -80,6 +297,8 @@ def split_for_manual_color(input_path, duplex=False, output_dir=None):
 
     try:
         original_page_count = len(document)
+        if progress_callback:
+            progress_callback(0, original_page_count)
         for index in range(original_page_count):
             page = document[index]
             page_rect = page.rect
@@ -112,6 +331,8 @@ def split_for_manual_color(input_path, duplex=False, output_dir=None):
                     from_page=index,
                     to_page=index,
                 )
+            if progress_callback:
+                progress_callback(index + 1, original_page_count)
 
         if duplex and original_page_count % 2:
             last_page = document[original_page_count - 1]
@@ -152,6 +373,7 @@ def split_for_manual_color(input_path, duplex=False, output_dir=None):
 
 
 def init_db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -204,20 +426,30 @@ def get_user_role(user_or_id) -> Optional[str]:
     return role[0] if role else None
 
 def is_user_authorized(user_or_id) -> bool:
-    return get_user_role(user_or_id) is not None
+    return _is_configured_super_admin(user_or_id) or (
+        get_user_role(user_or_id) is not None
+    )
 
 def is_admin(user_or_id) -> bool:
-    return get_user_role(user_or_id) == "admin"
+    return _is_configured_super_admin(user_or_id) or (
+        get_user_role(user_or_id) == "admin"
+    )
+
+
+def _is_configured_super_admin(user) -> bool:
+    """Match the explicitly configured owner without requiring DB seeding."""
+    if isinstance(user, int):
+        return False
+    username = (getattr(user, "username", None) or "").lstrip("@").casefold()
+    return (
+        bool(SUPER_ADMIN_USERNAME)
+        and username == SUPER_ADMIN_USERNAME
+    )
 
 
 def is_super_admin(user) -> bool:
     """Allow host-level operations only for the configured primary admin."""
-    username = (getattr(user, "username", None) or "").casefold()
-    return (
-        bool(SUPER_ADMIN_USERNAME)
-        and username == SUPER_ADMIN_USERNAME
-        and get_user_role(user) == "admin"
-    )
+    return _is_configured_super_admin(user)
 
 
 async def authorize_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -350,14 +582,18 @@ async def authorize_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Revoke a user's access; used by /unauthorize and the /remove alias."""
     admin = update.message.from_user
 
     if not is_admin(admin):
-        await update.message.reply_text("❌ You are not authorized to remove users.")
+        await update.message.reply_text("❌ You are not authorized to revoke users.")
         return
 
     if len(context.args) == 0 and not update.message.reply_to_message:
-        await update.message.reply_text("Usage: /remove <username> or reply to a user's message.")
+        await update.message.reply_text(
+            "Usage: /unauthorize <username>, or reply to a user's message "
+            "with /unauthorize."
+        )
         return
 
     replied_user = (
@@ -375,25 +611,65 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         username = None
         user_id_to_remove = None
 
+    if not username and user_id_to_remove is None:
+        await update.message.reply_text(
+            "❌ Specify a username, or reply to the user whose access "
+            "should be revoked."
+        )
+        return
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    if user_id_to_remove is not None:
-        cursor.execute(
-            "DELETE FROM authorized_users WHERE user_id = ?",
-            (user_id_to_remove,),
-        )
-    else:
-        cursor.execute(
-            "DELETE FROM authorized_users WHERE username = ? COLLATE NOCASE",
-            (username,),
-        )
-    removed = cursor.rowcount
-    conn.commit()
-    conn.close()
+    try:
+        if user_id_to_remove is not None:
+            cursor.execute(
+                """
+                SELECT id, username FROM authorized_users
+                WHERE user_id = ?
+                """,
+                (user_id_to_remove,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, username FROM authorized_users
+                WHERE username = ? COLLATE NOCASE
+                """,
+                (username,),
+            )
+        target = cursor.fetchone()
+
+        target_usernames = {
+            value.lstrip("@").casefold()
+            for value in (username, target[1] if target else None)
+            if value
+        }
+        if (
+            SUPER_ADMIN_USERNAME
+            and SUPER_ADMIN_USERNAME in target_usernames
+        ):
+            await update.message.reply_text(
+                "❌ The configured super admin cannot be unauthorized."
+            )
+            return
+
+        if target is None:
+            removed = 0
+        else:
+            cursor.execute(
+                "DELETE FROM authorized_users WHERE id = ?",
+                (target[0],),
+            )
+            removed = cursor.rowcount
+            conn.commit()
+    finally:
+        conn.close()
 
     if removed:
         display_name = f"@{username}" if username else f"ID {user_id_to_remove}"
-        await update.message.reply_text(f"✅ User {display_name} has been removed.")
+        await update.message.reply_text(
+            f"✅ Access revoked for {display_name}."
+        )
     else:
         await update.message.reply_text("❌ Authorized user not found.")
 
@@ -423,24 +699,33 @@ async def handle_file_upload(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("❌ The selected file is not a PDF.")
         return
 
-    file_id = document.file_id
-    file = await context.bot.get_file(file_id)
-
-    file_path = _upload_file_path(
-        update.effective_chat.id,
-        update.message.message_id,
-        document.file_name or "upload",
-    )
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Download the file
-    await file.download_to_drive(str(file_path))
-    if _is_pdf_document(document):
-        _remember_chat_pdf(
+    if is_pending_reply:
+        status = _pending_pdf_status(context, pending_split)
+        await status.update(_download_status_text(document), force=True)
+    else:
+        status = await _new_pdf_status(
+            update.message,
             context,
-            update.message.message_id,
-            file_path,
+            _download_status_text(document),
         )
+
+    try:
+        file_path = await _download_pdf_document(
+            context,
+            document,
+            update.effective_chat.id,
+            update.message.message_id,
+            status=status,
+        )
+    except PdfDownloadError as exc:
+        await status.update(str(exc), force=True)
+        return
+
+    _remember_chat_pdf(
+        context,
+        update.message.message_id,
+        file_path,
+    )
 
     if caption_args is not None:
         context.user_data.pop("pending_pdf_split", None)
@@ -448,7 +733,8 @@ async def handle_file_upload(update: Update, context: CallbackContext) -> None:
             update,
             context,
             args=caption_args,
-            input_path=str(file_path),
+            input_path=file_path,
+            status=status,
         )
         return
 
@@ -458,7 +744,8 @@ async def handle_file_upload(update: Update, context: CallbackContext) -> None:
             update,
             context,
             args=pending_split["args"],
-            input_path=str(file_path),
+            input_path=file_path,
+            status=status,
         )
         return
 
@@ -629,6 +916,8 @@ async def _download_pdf_document(
     document,
     source_chat_id,
     source_message_id,
+    *,
+    status=None,
 ):
     file_path = _upload_file_path(
         source_chat_id,
@@ -636,12 +925,106 @@ async def _download_pdf_document(
         document.file_name or "upload.pdf",
     )
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    telegram_file = await context.bot.get_file(document.file_id)
-    await telegram_file.download_to_drive(str(file_path))
+    # Preserve an already-complete cached copy if Telegram fails while
+    # redownloading the same message.
+    download_path = (
+        file_path.with_suffix(f"{file_path.suffix}.part")
+        if file_path.exists()
+        else file_path
+    )
+
+    async def download_with_mtproto():
+        try:
+            downloader = _get_mtproto_downloader()
+        except MtprotoConfigurationError as exc:
+            raise _large_download_setup_error(document, str(exc)) from exc
+        except MtprotoDependencyError as exc:
+            raise _large_download_setup_error(document, str(exc)) from exc
+
+        if status is not None:
+            size = _human_file_size(getattr(document, "file_size", None))
+            size_text = f" ({size})" if size else ""
+            await status.update(
+                f"⬇️ Preparing large-file download{size_text}…",
+                force=True,
+            )
+
+        async def report_progress(current, total):
+            if status is not None:
+                await status.update(
+                    _large_download_progress_text(
+                        document,
+                        current,
+                        total,
+                    )
+                )
+
+        try:
+            await downloader.download(
+                document.file_id,
+                download_path.resolve(),
+                report_progress if status is not None else None,
+            )
+        except (MtprotoConfigurationError, MtprotoDependencyError) as exc:
+            raise _large_download_setup_error(document, str(exc)) from exc
+        except MtprotoError as exc:
+            logger.warning(
+                "MTProto download failed for Telegram file %s",
+                getattr(document, "file_unique_id", "<unknown>"),
+                exc_info=True,
+            )
+            raise PdfDownloadError(
+                "❌ Could not download the selected PDF through Telegram's "
+                "large-file connection. Check TELEGRAM_API_ID and "
+                "TELEGRAM_API_HASH, or reply to a freshly uploaded copy, then "
+                "run /splitpdf again."
+            ) from exc
+
+    try:
+        if _requires_mtproto_download(document):
+            await download_with_mtproto()
+        else:
+            try:
+                telegram_file = await context.bot.get_file(document.file_id)
+                await telegram_file.download_to_drive(str(download_path))
+            except TelegramError as exc:
+                if "file is too big" not in str(exc).casefold():
+                    raise
+                try:
+                    download_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                await download_with_mtproto()
+        if download_path != file_path:
+            download_path.replace(file_path)
+    except PdfDownloadError:
+        try:
+            download_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    except TelegramError as exc:
+        try:
+            download_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        detail = str(exc)
+        if "file is too big" in detail.casefold():
+            detail = (
+                "Telegram rejected this hosted Bot API download and the "
+                "automatic large-file fallback did not complete."
+            )
+        raise PdfDownloadError(f"❌ Could not download the selected PDF: {detail}") from exc
+    except OSError as exc:
+        try:
+            download_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise PdfDownloadError(f"❌ Could not save the selected PDF: {exc}") from exc
     return str(file_path)
 
 
-async def _download_replied_pdf(update, context):
+async def _download_replied_pdf(update, context, status=None):
     message = getattr(update, "effective_message", None) or update.message
     document = _find_replied_pdf_document(message)
     if document is None:
@@ -658,13 +1041,14 @@ async def _download_replied_pdf(update, context):
         document,
         source_chat_id,
         source_message_id,
+        status=status,
     )
     if source_chat_id == current_chat_id:
         _remember_chat_pdf(context, source_message_id, file_path)
     return file_path
 
 
-async def _recover_replied_group_pdf(update, context):
+async def _recover_replied_group_pdf(update, context, status=None):
     """Recover an inaccessible replied file via a temporary private forward."""
     message = getattr(update, "effective_message", None) or update.message
     reference = _reply_message_reference(message, update.effective_chat.id)
@@ -695,6 +1079,7 @@ async def _recover_replied_group_pdf(update, context):
             document,
             source_chat_id,
             source_message_id,
+            status=status,
         )
         if source_chat_id == update.effective_chat.id:
             _remember_chat_pdf(context, source_message_id, file_path)
@@ -745,7 +1130,132 @@ async def _send_pdf_with_retry(message, output_path, label):
             await asyncio.sleep(2 ** (attempt - 1))
 
 
-async def split_pdf(update: Update, context: CallbackContext, args=None, input_path=None):
+def _pdf_split_process(input_path, duplex, output_dir, events):
+    """Process entry point; PyMuPDF can deadlock in Python worker threads."""
+    try:
+        last_percent = -1
+
+        def report(processed, total):
+            nonlocal last_percent
+            percent = (processed * 100) // total if total else 0
+            if processed not in (0, total) and percent <= last_percent:
+                return
+            last_percent = percent
+            events.put(("progress", processed, total))
+
+        result = split_for_manual_color(
+            input_path,
+            duplex,
+            output_dir,
+            report,
+        )
+        events.put(("result", result))
+    except Exception as exc:
+        events.put(("error", type(exc).__name__, str(exc)))
+
+
+def _pdf_worker_exception(name, detail):
+    if name == "FileNotFoundError":
+        return FileNotFoundError(detail)
+    if name == "ValueError":
+        return ValueError(detail)
+    if name == "FileDataError":
+        return fitz.FileDataError(detail)
+    return RuntimeError(f"PDF worker failed ({name}): {detail}")
+
+
+async def _split_pdf_with_progress(
+    input_path,
+    duplex,
+    output_dir,
+    status,
+):
+    """Run PyMuPDF in a process while asynchronously reporting progress."""
+    # This bot runs on Linux. A separate process avoids PyMuPDF's worker-thread
+    # deadlock while keeping the asyncio event loop responsive.
+    process_context = multiprocessing.get_context("fork")
+    events = process_context.Queue()
+    worker = process_context.Process(
+        target=_pdf_split_process,
+        args=(
+            input_path,
+            duplex,
+            output_dir,
+            events,
+        ),
+        daemon=True,
+    )
+    worker.start()
+
+    try:
+        while True:
+            event = None
+            try:
+                event = events.get_nowait()
+                while event[0] == "progress":
+                    latest_progress = event
+                    try:
+                        event = events.get_nowait()
+                    except queue.Empty:
+                        event = latest_progress
+                        break
+            except queue.Empty:
+                pass
+
+            if event is not None:
+                kind = event[0]
+                if kind == "result":
+                    return event[1]
+                if kind == "error":
+                    raise _pdf_worker_exception(event[1], event[2])
+                if kind == "progress":
+                    _, processed, total = event
+                    percent = round((processed / total) * 100) if total else 0
+                    await status.update(
+                        f"⚙️ Splitting PDF: {processed}/{total} pages "
+                        f"({percent}%)…"
+                    )
+
+            if not worker.is_alive():
+                # Queue feeder delivery can lag process exit very briefly.
+                # Drain with a bounded grace period before treating it as a
+                # crashed worker.
+                loop = asyncio.get_running_loop()
+                grace_deadline = loop.time() + 0.5
+                while loop.time() < grace_deadline:
+                    try:
+                        final_event = events.get_nowait()
+                    except queue.Empty:
+                        await asyncio.sleep(0.05)
+                        continue
+                    if final_event[0] == "result":
+                        return final_event[1]
+                    if final_event[0] == "error":
+                        raise _pdf_worker_exception(
+                            final_event[1],
+                            final_event[2],
+                        )
+                raise RuntimeError(
+                    f"PDF worker stopped unexpectedly (exit {worker.exitcode})."
+                )
+            await asyncio.sleep(0.1)
+    finally:
+        if worker.is_alive():
+            await asyncio.to_thread(worker.join, 1)
+        if worker.is_alive():
+            worker.terminate()
+            await asyncio.to_thread(worker.join, 1)
+        worker.close()
+        events.close()
+
+
+async def split_pdf(
+    update: Update,
+    context: CallbackContext,
+    args=None,
+    input_path=None,
+    status=None,
+):
     """Split the latest/replied PDF and send all generated files to Telegram."""
     if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to split files.")
@@ -754,15 +1264,38 @@ async def split_pdf(update: Update, context: CallbackContext, args=None, input_p
     try:
         duplex = _duplex_from_args(context.args if args is None else args)
     except ValueError as exc:
-        await update.message.reply_text(str(exc))
+        if status is None:
+            await update.message.reply_text(str(exc))
+        else:
+            await status.update(str(exc), force=True)
         return
 
     message = getattr(update, "effective_message", None) or update.message
     current_chat_id = update.effective_chat.id
     explicit_reply = _has_explicit_reply(message)
+    if status is None:
+        status = await _new_pdf_status(
+            update.message,
+            context,
+            "🔎 Locating the selected PDF…",
+        )
 
-    if input_path is None:
-        input_path = await _download_replied_pdf(update, context)
+    try:
+        if input_path is None:
+            replied_document = _find_replied_pdf_document(message)
+            if replied_document is not None:
+                await status.update(
+                    _download_status_text(replied_document),
+                    force=True,
+                )
+            input_path = await _download_replied_pdf(
+                update,
+                context,
+                status=status,
+            )
+    except PdfDownloadError as exc:
+        await status.update(str(exc), force=True)
+        return
     if input_path is None and explicit_reply:
         input_path = _cached_replied_pdf(
             message,
@@ -770,10 +1303,22 @@ async def split_pdf(update: Update, context: CallbackContext, args=None, input_p
             context,
         )
     if input_path is None and explicit_reply:
-        input_path = await _recover_replied_group_pdf(update, context)
+        await status.update(
+            "⬇️ Recovering and downloading the selected group PDF…",
+            force=True,
+        )
+        try:
+            input_path = await _recover_replied_group_pdf(
+                update,
+                context,
+                status=status,
+            )
+        except PdfDownloadError as exc:
+            await status.update(str(exc), force=True)
+            return
     if not input_path:
         pending_args = ["--duplex"] if duplex else []
-        prompt = await update.message.reply_text(
+        prompt_text = (
             "No downloadable PDF was selected. If you replied to a PDF, "
             "Telegram may have hidden it because group privacy is enabled.\n\n"
             "Reply directly to this bot message with the PDF file. I will "
@@ -781,69 +1326,58 @@ async def split_pdf(update: Update, context: CallbackContext, args=None, input_p
             "mode.\n\n"
             "You can also send the PDF with /splitpdf as its caption."
         )
+        await status.update(prompt_text, force=True)
         context.user_data["pending_pdf_split"] = {
             "args": pending_args,
             "chat_id": update.effective_chat.id,
-            "prompt_message_id": prompt.message_id,
+            "prompt_message_id": status.message_id,
         }
         return
     if Path(input_path).suffix.lower() != ".pdf":
-        await update.message.reply_text("❌ The selected file is not a PDF.")
+        await status.update("❌ The selected file is not a PDF.", force=True)
         return
 
-    status = await update.message.reply_text(
-        f"Splitting PDF in {'duplex' if duplex else 'simplex'} mode…"
+    await status.update(
+        f"⚙️ Splitting PDF in {'duplex' if duplex else 'simplex'} mode…",
+        force=True,
     )
 
     try:
         with tempfile.TemporaryDirectory(prefix="telegram-pdf-") as output_dir:
-            result = await asyncio.to_thread(
-                split_for_manual_color,
+            result = await _split_pdf_with_progress(
                 input_path,
                 duplex,
                 output_dir,
+                status,
             )
 
-            await status.edit_text(result.guide[:4096])
             for label, output_path in (
                 ("B&W pages", result.bw_path),
                 ("Color pages", result.color_path),
             ):
                 if output_path:
+                    await status.update(
+                        f"⬆️ Uploading {label}…",
+                        force=True,
+                    )
                     await _send_pdf_with_retry(
                         update.message,
                         output_path,
                         label,
                     )
+            await status.update(
+                _split_completion_text(result, duplex),
+                force=True,
+            )
     except (FileNotFoundError, ValueError, fitz.FileDataError) as exc:
-        await status.edit_text(f"❌ Could not split PDF: {exc}")
+        await status.update(f"❌ Could not split PDF: {exc}", force=True)
     except TelegramError as exc:
-        await status.edit_text(f"❌ Telegram could not send the result: {exc}")
+        await status.update(
+            f"❌ Telegram could not send the result: {exc}",
+            force=True,
+        )
     except Exception as exc:
-        await status.edit_text(f"❌ Unexpected PDF processing error: {exc}")
-
-def get_ram_info():
-    try:
-        result = subprocess.run(["sudo", "dmidecode", "--type", "17"], capture_output=True, text=True)
-        output = result.stdout
-
-        ram_info = []
-        for ram_block in output.split("\n\n"):
-            manufacturer = re.search(r"Manufacturer:\s+(.+)", ram_block)
-            speed = re.search(r"Speed:\s+(.+)", ram_block)
-            ram_type = re.search(r"Type:\s+(.+)", ram_block)
-            form_factor = re.search(r"Form Factor:\s+(.+)", ram_block)
-            size = re.search(r"Size:\s+(.+)", ram_block)
-
-            if size and "No Module Installed" not in size.group(1):  # Ignore empty slots
-                ram_info.append({
-                    "Manufacturer": manufacturer.group(1) if manufacturer else "Unknown",
-                    "Speed": speed.group(1) if speed else "Unknown",
-                    "Type": ram_type.group(1) if ram_type else "Unknown",
-                    "Form Factor": form_factor.group(1) if form_factor else "Unknown",
-                    "Size": size.group(1)
-                })
-
-        return ram_info
-    except Exception as e:
-        return [f"Error retrieving RAM info: {str(e)}"]
+        await status.update(
+            f"❌ Unexpected PDF processing error: {exc}",
+            force=True,
+        )

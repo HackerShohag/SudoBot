@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -8,8 +9,10 @@ from unittest.mock import AsyncMock, patch
 from bot.utils import (
     authorize_user,
     init_db,
+    is_admin,
     is_super_admin,
     is_user_authorized,
+    remove_user,
 )
 
 
@@ -34,7 +37,7 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.temp_dir.cleanup()
 
     def insert_user(self, user, role, user_id=True):
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
             connection.execute(
                 """
                 INSERT INTO authorized_users
@@ -74,7 +77,7 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
             bound_id = connection.execute(
                 "SELECT user_id FROM authorized_users WHERE username = ?",
                 ("PendingUser",),
@@ -90,7 +93,7 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
         with patch("bot.utils.DB_PATH", self.db_path):
             await authorize_user(update, context)
 
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
             row = connection.execute(
                 """
                 SELECT user_id, role FROM authorized_users
@@ -110,7 +113,7 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
         with patch("bot.utils.DB_PATH", self.db_path):
             await authorize_user(update, context)
 
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
             row = connection.execute(
                 """
                 SELECT user_id, role FROM authorized_users
@@ -124,7 +127,7 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_only_configured_admin_username_is_super_admin(self):
         self.admin.username = "HackerShohag"
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
             connection.execute(
                 "UPDATE authorized_users SET username = ? WHERE user_id = ?",
                 (self.admin.username, self.admin.id),
@@ -138,6 +141,107 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertTrue(is_super_admin(self.admin))
             self.assertFalse(is_super_admin(other_admin))
+
+    async def test_configured_super_admin_bootstraps_without_database_row(self):
+        owner = telegram_user(1000, "ConfiguredOwner", "Configured Owner")
+
+        with (
+            patch("bot.utils.DB_PATH", self.db_path),
+            patch("bot.utils.SUPER_ADMIN_USERNAME", "configuredowner"),
+        ):
+            self.assertTrue(is_user_authorized(owner))
+            self.assertTrue(is_admin(owner))
+            self.assertTrue(is_super_admin(owner))
+
+    async def test_admin_can_revoke_user_by_username(self):
+        target = telegram_user(400, "TargetUser", "Target User")
+        self.insert_user(target, "user")
+        update = self.make_update()
+        context = SimpleNamespace(args=["@targetuser"])
+
+        with patch("bot.utils.DB_PATH", self.db_path):
+            await remove_user(update, context)
+
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            remaining = connection.execute(
+                "SELECT COUNT(*) FROM authorized_users WHERE user_id = ?",
+                (target.id,),
+            ).fetchone()[0]
+        self.assertEqual(remaining, 0)
+        update.message.reply_text.assert_awaited_once_with(
+            "✅ Access revoked for @targetuser."
+        )
+
+    async def test_admin_can_revoke_user_by_reply_without_username(self):
+        target = telegram_user(401, None, "No Username")
+        self.insert_user(target, "user")
+        update = self.make_update(replied_user=target)
+        context = SimpleNamespace(args=[])
+
+        with patch("bot.utils.DB_PATH", self.db_path):
+            await remove_user(update, context)
+
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            remaining = connection.execute(
+                "SELECT COUNT(*) FROM authorized_users WHERE user_id = ?",
+                (target.id,),
+            ).fetchone()[0]
+        self.assertEqual(remaining, 0)
+        update.message.reply_text.assert_awaited_once_with(
+            "✅ Access revoked for ID 401."
+        )
+
+    async def test_non_admin_cannot_revoke_user(self):
+        target = telegram_user(402, "protected_user", "Protected User")
+        requester = telegram_user(403, "ordinary_user", "Ordinary User")
+        self.insert_user(target, "user")
+        self.insert_user(requester, "user")
+        update = self.make_update()
+        update.message.from_user = requester
+        context = SimpleNamespace(args=[target.username])
+
+        with patch("bot.utils.DB_PATH", self.db_path):
+            await remove_user(update, context)
+
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            remaining = connection.execute(
+                "SELECT COUNT(*) FROM authorized_users WHERE user_id = ?",
+                (target.id,),
+            ).fetchone()[0]
+        self.assertEqual(remaining, 1)
+        update.message.reply_text.assert_awaited_once_with(
+            "❌ You are not authorized to revoke users."
+        )
+
+    async def test_admin_cannot_revoke_configured_super_admin(self):
+        owner = telegram_user(404, "HackerShohag", "Owner")
+        self.insert_user(owner, "admin")
+        update = self.make_update()
+        context = SimpleNamespace(args=["@hackershohag"])
+
+        with (
+            patch("bot.utils.DB_PATH", self.db_path),
+            patch("bot.utils.SUPER_ADMIN_USERNAME", "hackershohag"),
+        ):
+            await remove_user(update, context)
+
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            remaining = connection.execute(
+                "SELECT COUNT(*) FROM authorized_users WHERE user_id = ?",
+                (owner.id,),
+            ).fetchone()[0]
+        self.assertEqual(remaining, 1)
+        update.message.reply_text.assert_awaited_once_with(
+            "❌ The configured super admin cannot be unauthorized."
+        )
+
+    async def test_init_db_creates_missing_parent_directory(self):
+        nested_path = Path(self.temp_dir.name) / "new" / "db" / "users.db"
+
+        with patch("bot.utils.DB_PATH", str(nested_path)):
+            init_db()
+
+        self.assertTrue(nested_path.is_file())
 
 
 if __name__ == "__main__":

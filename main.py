@@ -1,11 +1,40 @@
 import asyncio
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler
+import logging
+
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
 from bot.config import BOT_TOKEN
 from bot.bot import run_command, password_input, stop_command, AWAITING_SUDO_PASSWORD
 from bot import menu
-from bot.utils import authorize_user, remove_user, handle_file_upload, split_pdf
-from telegram.ext import CommandHandler, MessageHandler, filters
+from bot.utils import (
+    authorize_user,
+    close_mtproto_downloader,
+    handle_file_upload,
+    remove_user,
+    split_pdf,
+)
 from bot.bot import execute_on_file
+
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+async def handle_application_error(update, context):
+    """Record unexpected handler failures with timestamps and tracebacks."""
+    logger.error(
+        "Unhandled exception while processing a Telegram update",
+        exc_info=context.error,
+    )
 
 async def main():
     application = (
@@ -43,14 +72,21 @@ async def main():
     )
 
     application.add_handler(CommandHandler("authorize", authorize_user))
-    application.add_handler(CommandHandler("remove", remove_user))
+    # /remove remains a backwards-compatible alias for /unauthorize.
+    application.add_handler(
+        CommandHandler(("unauthorize", "remove"), remove_user)
+    )
+    application.add_error_handler(handle_application_error)
 
-    await application.initialize()
-    print("Bot is running...")
-    await menu.set_bot_menu(application)
-    await application.start()
-    await application.updater.start_polling()
-    await asyncio.Future()
+    try:
+        await application.initialize()
+        print("Bot is running...", flush=True)
+        await menu.set_bot_menu(application)
+        await application.start()
+        await application.updater.start_polling()
+        await asyncio.Future()
+    finally:
+        await close_mtproto_downloader()
 
 if __name__ == '__main__':
     try:
