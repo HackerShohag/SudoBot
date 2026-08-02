@@ -15,6 +15,8 @@ from pathlib import Path
 import fitz
 from PIL import Image, ImageChops
 
+from bot.config import SUPER_ADMIN_USERNAME
+
 UPLOAD_DIR = "uploads"
 DB_PATH = "db/authorized_users.db"
 PDF_UPLOAD_ATTEMPTS = 3
@@ -208,6 +210,16 @@ def is_admin(user_or_id) -> bool:
     return get_user_role(user_or_id) == "admin"
 
 
+def is_super_admin(user) -> bool:
+    """Allow host-level operations only for the configured primary admin."""
+    username = (getattr(user, "username", None) or "").casefold()
+    return (
+        bool(SUPER_ADMIN_USERNAME)
+        and username == SUPER_ADMIN_USERNAME
+        and get_user_role(user) == "admin"
+    )
+
+
 async def authorize_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin = update.message.from_user
 
@@ -386,11 +398,31 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Authorized user not found.")
 
 async def handle_file_upload(update: Update, context: CallbackContext) -> None:
-    if not is_user_authorized(update.message.from_user):
-        await update.message.reply_text("❌ You are not authorized to upload files.")
+    document = update.message.document
+    caption_args = _splitpdf_caption_args(update.message.caption)
+    pending_split = context.user_data.get("pending_pdf_split")
+    replied_message = getattr(update.message, "reply_to_message", None)
+    is_pending_reply = bool(
+        pending_split
+        and pending_split.get("chat_id") == update.effective_chat.id
+        and replied_message
+        and replied_message.message_id
+        == pending_split.get("prompt_message_id")
+    )
+
+    # With group privacy disabled the bot receives every document. Ignore all
+    # files unless the sender explicitly selected one for PDF splitting.
+    if caption_args is None and not is_pending_reply:
         return
 
-    document = update.message.document
+    if not is_user_authorized(update.message.from_user):
+        await update.message.reply_text("❌ You are not authorized to split files.")
+        return
+
+    if not _is_pdf_document(document):
+        await update.message.reply_text("❌ The selected file is not a PDF.")
+        return
+
     file_id = document.file_id
     file = await context.bot.get_file(file_id)
 
@@ -410,7 +442,6 @@ async def handle_file_upload(update: Update, context: CallbackContext) -> None:
             file_path,
         )
 
-    caption_args = _splitpdf_caption_args(update.message.caption)
     if caption_args is not None:
         context.user_data.pop("pending_pdf_split", None)
         await split_pdf(
@@ -421,17 +452,7 @@ async def handle_file_upload(update: Update, context: CallbackContext) -> None:
         )
         return
 
-    pending_split = context.user_data.get("pending_pdf_split")
-    current_chat_id = update.effective_chat.id
-    if (
-        pending_split
-        and pending_split.get("chat_id") == current_chat_id
-    ):
-        if not _is_pdf_document(document):
-            await update.message.reply_text(
-                "❌ That file is not a PDF. Reply with a PDF to continue."
-            )
-            return
+    if is_pending_reply:
         context.user_data.pop("pending_pdf_split", None)
         await split_pdf(
             update,
@@ -440,15 +461,6 @@ async def handle_file_upload(update: Update, context: CallbackContext) -> None:
             input_path=str(file_path),
         )
         return
-
-    suffix = (
-        "\nUse /splitpdf or /splitpdf --duplex to split this PDF."
-        if _is_pdf_document(document)
-        else ""
-    )
-    await update.message.reply_text(
-        f"File uploaded successfully: {file_path}{suffix}"
-    )
 
 
 def _splitpdf_caption_args(caption):
@@ -500,7 +512,6 @@ def _upload_file_path(chat_id, message_id, file_name):
 
 def _remember_chat_pdf(context, message_id, file_path):
     file_path = str(file_path)
-    context.chat_data["last_uploaded_pdf"] = file_path
     context.chat_data.setdefault("uploaded_pdfs", {})[
         str(message_id)
     ] = file_path
@@ -611,22 +622,6 @@ def _cached_replied_pdf(message, current_chat_id, context):
         ),
         None,
     )
-
-
-def _latest_chat_pdf(current_chat_id, context):
-    cached = context.chat_data.get("last_uploaded_pdf")
-    if cached and Path(cached).is_file():
-        return cached
-
-    chat_dir = Path(UPLOAD_DIR) / str(current_chat_id)
-    if not chat_dir.is_dir():
-        return None
-    pdfs = [
-        path
-        for path in chat_dir.rglob("*")
-        if path.is_file() and path.suffix.lower() == ".pdf"
-    ]
-    return str(max(pdfs, key=lambda path: path.stat().st_mtime)) if pdfs else None
 
 
 async def _download_pdf_document(
@@ -776,22 +771,21 @@ async def split_pdf(update: Update, context: CallbackContext, args=None, input_p
         )
     if input_path is None and explicit_reply:
         input_path = await _recover_replied_group_pdf(update, context)
-    if input_path is None and not explicit_reply:
-        input_path = _latest_chat_pdf(current_chat_id, context)
     if not input_path:
         pending_args = ["--duplex"] if duplex else []
-        context.user_data["pending_pdf_split"] = {
-            "args": pending_args,
-            "chat_id": update.effective_chat.id,
-        }
-        await update.message.reply_text(
-            "Telegram did not expose a downloadable PDF in that reply. "
-            "This commonly happens in groups when bot privacy is enabled.\n\n"
+        prompt = await update.message.reply_text(
+            "No downloadable PDF was selected. If you replied to a PDF, "
+            "Telegram may have hidden it because group privacy is enabled.\n\n"
             "Reply directly to this bot message with the PDF file. I will "
             f"split it automatically in {'duplex' if duplex else 'simplex'} "
             "mode.\n\n"
             "You can also send the PDF with /splitpdf as its caption."
         )
+        context.user_data["pending_pdf_split"] = {
+            "args": pending_args,
+            "chat_id": update.effective_chat.id,
+            "prompt_message_id": prompt.message_id,
+        }
         return
     if Path(input_path).suffix.lower() != ".pdf":
         await update.message.reply_text("❌ The selected file is not a PDF.")

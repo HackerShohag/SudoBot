@@ -1,8 +1,7 @@
 import asyncio
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler
 from bot.config import BOT_TOKEN
 from bot.bot import run_command, password_input, stop_command, AWAITING_SUDO_PASSWORD
-from bot.keyboard import handle_command_from_keyboard
 from bot import menu
 from bot.utils import authorize_user, remove_user, handle_file_upload, split_pdf
 from telegram.ext import CommandHandler, MessageHandler, filters
@@ -43,7 +42,6 @@ async def main():
         )
     )
 
-    application.add_handler(CallbackQueryHandler(handle_command_from_keyboard))
     application.add_handler(CommandHandler("authorize", authorize_user))
     application.add_handler(CommandHandler("remove", remove_user))
 

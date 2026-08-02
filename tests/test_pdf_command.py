@@ -12,7 +12,6 @@ from bot.utils import (
     _duplex_from_args,
     _cached_replied_pdf,
     _find_replied_pdf_document,
-    _latest_chat_pdf,
     _recover_replied_group_pdf,
     _upload_file_path,
     handle_file_upload,
@@ -127,22 +126,6 @@ class RepliedPdfDiscoveryTests(unittest.TestCase):
             _cached_replied_pdf(command, -500, context)
         )
 
-    def test_latest_pdf_is_scoped_to_current_chat_directory(self):
-        with TemporaryDirectory() as tmp:
-            private_pdf = Path(tmp) / "uploads" / "100" / "1" / "private.pdf"
-            group_pdf = Path(tmp) / "uploads" / "-500" / "2" / "group.pdf"
-            private_pdf.parent.mkdir(parents=True)
-            group_pdf.parent.mkdir(parents=True)
-            private_pdf.write_bytes(b"private")
-            group_pdf.write_bytes(b"group")
-            context = SimpleNamespace(chat_data={})
-
-            with patch("bot.utils.UPLOAD_DIR", str(Path(tmp) / "uploads")):
-                selected = _latest_chat_pdf(-500, context)
-
-        self.assertEqual(selected, str(group_pdf))
-
-
 class PdfUploadRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_pdf_upload_retries_timeouts(self):
         with TemporaryDirectory() as tmp:
@@ -180,10 +163,11 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_missing_replied_file_starts_pending_duplex_upload(self):
+        prompt_message = SimpleNamespace(message_id=700)
         message = SimpleNamespace(
             from_user=SimpleNamespace(id=100, username="user"),
             reply_to_message=SimpleNamespace(),
-            reply_text=AsyncMock(),
+            reply_text=AsyncMock(return_value=prompt_message),
         )
         context = SimpleNamespace(
             args=["--duplex"],
@@ -208,7 +192,11 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             context.user_data["pending_pdf_split"],
-            {"args": ["--duplex"], "chat_id": 500},
+            {
+                "args": ["--duplex"],
+                "chat_id": 500,
+                "prompt_message_id": 700,
+            },
         )
         prompt = message.reply_text.await_args.args[0]
         self.assertIn("Reply directly to this bot message", prompt)
@@ -224,6 +212,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 mime_type="application/pdf",
             ),
             caption=None,
+            reply_to_message=SimpleNamespace(message_id=700),
             reply_text=AsyncMock(),
         )
         context = SimpleNamespace(
@@ -234,6 +223,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 "pending_pdf_split": {
                     "args": ["--duplex"],
                     "chat_id": 500,
+                    "prompt_message_id": 700,
                 }
             },
             chat_data={},
@@ -258,6 +248,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("pending_pdf_split", context.user_data)
 
     async def test_explicit_group_reply_never_uses_private_last_upload(self):
+        prompt_message = SimpleNamespace(message_id=701)
         message = SimpleNamespace(
             from_user=SimpleNamespace(id=100, username="user"),
             message_id=44,
@@ -266,7 +257,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 chat=SimpleNamespace(id=-500),
             ),
             external_reply=None,
-            reply_text=AsyncMock(),
+            reply_text=AsyncMock(return_value=prompt_message),
         )
         context = SimpleNamespace(
             args=[],
@@ -295,7 +286,63 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("pending_pdf_split", context.user_data)
         prompt = message.reply_text.await_args.args[0]
-        self.assertIn("did not expose", prompt)
+        self.assertIn("No downloadable PDF was selected", prompt)
+
+    async def test_ordinary_group_document_is_completely_ignored(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=100, username="user"),
+            message_id=50,
+            document=SimpleNamespace(
+                file_id="ordinary-file-id",
+                file_name="ordinary.pdf",
+                mime_type="application/pdf",
+            ),
+            caption=None,
+            reply_to_message=None,
+            reply_text=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            bot=SimpleNamespace(get_file=AsyncMock()),
+            user_data={},
+            chat_data={},
+        )
+
+        with patch("bot.utils.is_user_authorized") as authorized:
+            await handle_file_upload(self.update(message, chat_id=-500), context)
+
+        context.bot.get_file.assert_not_awaited()
+        authorized.assert_not_called()
+        message.reply_text.assert_not_awaited()
+
+    async def test_pending_file_not_replying_to_prompt_is_ignored(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=100, username="user"),
+            message_id=51,
+            document=SimpleNamespace(
+                file_id="unselected-file-id",
+                file_name="unselected.pdf",
+                mime_type="application/pdf",
+            ),
+            caption=None,
+            reply_to_message=SimpleNamespace(message_id=999),
+            reply_text=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            bot=SimpleNamespace(get_file=AsyncMock()),
+            user_data={
+                "pending_pdf_split": {
+                    "args": [],
+                    "chat_id": -500,
+                    "prompt_message_id": 700,
+                }
+            },
+            chat_data={},
+        )
+
+        await handle_file_upload(self.update(message, chat_id=-500), context)
+
+        context.bot.get_file.assert_not_awaited()
+        self.assertIn("pending_pdf_split", context.user_data)
 
     async def test_inaccessible_group_pdf_is_recovered_by_private_forward(self):
         document = SimpleNamespace(

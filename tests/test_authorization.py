@@ -5,7 +5,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from bot.utils import authorize_user, init_db, is_user_authorized
+from bot.utils import (
+    authorize_user,
+    init_db,
+    is_super_admin,
+    is_user_authorized,
+)
 
 
 def telegram_user(user_id, username, full_name):
@@ -116,6 +121,23 @@ class AuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row, (None, "user"))
         response = update.message.reply_text.await_args.args[0]
         self.assertIn("ID will be linked", response)
+
+    async def test_only_configured_admin_username_is_super_admin(self):
+        self.admin.username = "HackerShohag"
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "UPDATE authorized_users SET username = ? WHERE user_id = ?",
+                (self.admin.username, self.admin.id),
+            )
+        other_admin = telegram_user(999, "another_admin", "Another Admin")
+        self.insert_user(other_admin, "admin")
+
+        with (
+            patch("bot.utils.DB_PATH", self.db_path),
+            patch("bot.utils.SUPER_ADMIN_USERNAME", "hackershohag"),
+        ):
+            self.assertTrue(is_super_admin(self.admin))
+            self.assertFalse(is_super_admin(other_admin))
 
 
 if __name__ == "__main__":

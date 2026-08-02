@@ -3,7 +3,7 @@
 SudoBot is a powerful **Telegram Bot** that allows users to execute commands, retrieve system information, check IP details, and manage system processes—all from Telegram.
 
 ## 🚀 Features
-- ✅ **Command Execution:** Run shell commands remotely.
+- ✅ **Command Execution:** Run shell commands remotely as the configured super admin.
 - 🌍 **IP Information:** Fetch local and public IP addresses.
 - 🖥️ **System Monitoring:** Get system details and disk usage.
 - 📜 **Menu Integration:** Access bot features via a built-in menu.
@@ -15,10 +15,11 @@ SudoBot is a powerful **Telegram Bot** that allows users to execute commands, re
 
 You can use the PDF splitter in any of these ways:
 
-1. Upload a PDF, then send `/splitpdf`.
-2. Upload a PDF, then send `/splitpdf --duplex` (or `/splitpdf -d`).
-3. Reply to an existing PDF with `/splitpdf` or `/splitpdf --duplex`.
-4. Upload a PDF with `/splitpdf --duplex` as its caption.
+1. Reply to a specific PDF with `/splitpdf` or `/splitpdf --duplex`.
+2. Upload a PDF with `/splitpdf` or `/splitpdf --duplex` as its caption.
+3. If prompted for a file, reply directly to that bot prompt with the PDF.
+
+Ordinary documents are ignored and are never downloaded by the bot.
 
 Simplex mode removes color pages from the B&W output. Duplex mode preserves
 page positions with blanks and reports the sheet side where each color page
@@ -96,6 +97,7 @@ cp .env.example .env
 ### 📌 Edit `.env` File
 ```ini
 BOT_TOKEN=your_telegram_bot_token
+SUPER_ADMIN_USERNAME=hackershohag
 ```
 - Get your `BOT_TOKEN` from [BotFather](https://t.me/BotFather) on Telegram.
 

@@ -3,7 +3,7 @@ from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler, CallbackContext
 from telegram.error import RetryAfter
 from bot.keyboard import update_command_history, update_keyboard
-from bot.utils import is_user_authorized
+from bot.utils import is_super_admin
 from bot.config import MAX_CHARS
 import signal
 import subprocess
@@ -15,6 +15,12 @@ UPLOAD_DIR = "uploads"
 
 async def execute_command(command: str, update, context, reply_to_message_id):
     global running_process
+    if not is_super_admin(update.message.from_user):
+        await update.message.reply_text(
+            "❌ Only the super admin can run host commands."
+        )
+        return
+
     running_process = await asyncio.create_subprocess_shell(
         command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
@@ -86,6 +92,12 @@ async def execute_command(command: str, update, context, reply_to_message_id):
     await update_keyboard(update, context)
 
 async def execute_on_file(update: Update, context: CallbackContext) -> None:
+    if not is_super_admin(update.message.from_user):
+        await update.message.reply_text(
+            "❌ Only the super admin can run host commands."
+        )
+        return
+
     if len(context.args) < 2:
         await update.message.reply_text("Usage: `/runfile <filename> <command>`", parse_mode="MarkdownV2")
         return
@@ -139,8 +151,10 @@ async def send_large_output(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         )
 
 async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_user_authorized(update.message.from_user):
-        await update.message.reply_text("❌ You are not authorized to run commands.")
+    if not is_super_admin(update.message.from_user):
+        await update.message.reply_text(
+            "❌ Only the super admin can run host commands."
+        )
         return
 
     command = ' '.join(context.args)
@@ -160,6 +174,15 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await execute_command(command, update, context, update.message.message_id)
 
 async def password_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_super_admin(update.message.from_user):
+        context.user_data.pop('command', None)
+        context.user_data.pop('original_message_id', None)
+        context.user_data.pop('password_message_id', None)
+        await update.message.reply_text(
+            "❌ Only the super admin can run host commands."
+        )
+        return ConversationHandler.END
+
     password = update.message.text
     command = context.user_data.get('command')
     original_message_id = context.user_data.get('original_message_id')
@@ -179,6 +202,12 @@ async def password_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global running_process
+    if not is_super_admin(update.message.from_user):
+        await update.message.reply_text(
+            "❌ Only the super admin can stop host commands."
+        )
+        return
+
     if running_process and running_process.returncode is None:
         running_process.send_signal(signal.SIGTERM)  # Send SIGTERM instead of terminate()
         try:

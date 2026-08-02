@@ -1,4 +1,4 @@
-from telegram import InlineKeyboardButton, ReplyKeyboardMarkup
+from telegram import KeyboardButton, ReplyKeyboardMarkup
 import sqlite3
 
 # Initialize the database connection
@@ -38,12 +38,12 @@ def generate_keyboard(user_id):
     
     # Add the most frequent commands to the keyboard in 2 columns
     for i in range(0, len(frequent_commands), 2):
-        row = [InlineKeyboardButton(cmd, callback_data=cmd) for cmd in frequent_commands[i:i+2]]
+        row = [KeyboardButton(cmd) for cmd in frequent_commands[i:i+2]]
         buttons.append(row)
 
     # Add the last run command as well
     if user_id in last_run_command and last_run_command[user_id]:
-        buttons.append([InlineKeyboardButton(f"{last_run_command[user_id]}", callback_data=last_run_command[user_id])])
+        buttons.append([KeyboardButton(last_run_command[user_id])])
 
     # Return the keyboard layout
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True)
@@ -58,17 +58,6 @@ async def update_keyboard(update, context):
         text="Frequently used commands:",
         reply_markup=new_keyboard
     )
-
-# Function to handle command re-execution from the inline keyboard
-async def handle_command_from_keyboard(update, context, execute_command_callback):
-    query = update.callback_query
-    command = query.data  # Get the command from the callback data
-    
-    # Execute the command and reply to the original message
-    await execute_command_callback(command, update, context)
-    
-    # Acknowledge the callback query to remove the "loading" state on the button
-    await query.answer()
 
 def update_command_history(update, context):
     global last_run_command
