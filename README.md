@@ -23,14 +23,17 @@ You can use the PDF splitter in any of these ways:
 Ordinary documents are ignored and are never downloaded by the bot.
 
 The bot keeps one status message updated while it downloads the selected PDF,
-splits each page, uploads the B&W and color results, and finishes. Files up to
-20 MB use Telegram's hosted Bot API. Larger files automatically use a direct
-MTProto download when `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are configured;
-no Docker or local Bot API server is required.
+splits each page, uploads the B&W and color results, and finishes. Result
+uploads show streamed bytes, percentage, elapsed time, and retry attempts in
+that same status message. Files up to 20 MB use Telegram's hosted Bot API.
+Larger files automatically use a direct MTProto download when
+`TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are configured; no Docker or local
+Bot API server is required.
 
-Simplex mode removes color pages from the B&W output. Duplex mode preserves
-page positions with blanks and reports the sheet side where each color page
-must be overprinted. `/printer` is an alias for `/splitpdf`.
+Simplex mode removes color pages from the B&W output and finishes with a short
+summary. Duplex mode preserves page positions with blanks and includes the
+printing guide showing the sheet side where each color page must be
+overprinted. `/printer` is an alias for `/splitpdf`.
 
 In privacy-enabled Telegram groups, the Bot API may not expose a PDF that was
 sent before the command. If that happens, the bot prompts for the file: reply

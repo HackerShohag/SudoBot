@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.ext import ContextTypes, CallbackContext
 from telegram.error import NetworkError, RetryAfter, TelegramError
 from pathlib import Path
@@ -39,6 +39,7 @@ PDF_UPLOAD_CONNECT_TIMEOUT = 30
 PDF_UPLOAD_POOL_TIMEOUT = 30
 PDF_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 PDF_STATUS_EDIT_INTERVAL = 2.0
+PDF_UPLOAD_STATUS_INTERVAL = 1.0
 
 logger = logging.getLogger(__name__)
 _mtproto_downloader = None
@@ -55,6 +56,41 @@ class SplitResult:
 
 class PdfDownloadError(Exception):
     """A selected PDF could not be downloaded from Telegram."""
+
+
+class _UploadProgressFile:
+    """Delegate a binary file while counting bytes consumed by HTTPX."""
+
+    def __init__(self, raw_file, total_bytes):
+        self._raw_file = raw_file
+        self.total_bytes = max(int(total_bytes), 0)
+        self.transferred = 0
+        self.name = raw_file.name
+
+    def read(self, size=-1):
+        chunk = self._raw_file.read(size)
+        self.transferred = min(
+            self.total_bytes,
+            self.transferred + len(chunk),
+        )
+        return chunk
+
+    def seek(self, offset, whence=0):
+        position = self._raw_file.seek(offset, whence)
+        # HTTPX seeks to zero immediately before rendering the multipart body.
+        # Resetting here also makes every network retry begin at a truthful 0%.
+        if position == 0:
+            self.transferred = 0
+        return position
+
+    def tell(self):
+        return self._raw_file.tell()
+
+    def fileno(self):
+        return self._raw_file.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._raw_file, name)
 
 
 class _PdfStatus:
@@ -241,6 +277,8 @@ def _split_completion_text(result, duplex):
         f"B&W pages: {result.bw_pages}\n"
         f"Color pages: {result.color_pages}"
     )
+    if not duplex or not result.guide:
+        return summary
     detail_prefix = "\n\nPrinting guide:\n"
     available = 4096 - len(summary) - len(detail_prefix)
     guide = result.guide[:available]
@@ -1097,22 +1135,148 @@ async def _recover_replied_group_pdf(update, context, status=None):
                 pass
 
 
-async def _send_pdf_with_retry(message, output_path, label):
-    """Upload a PDF with long media timeouts and transient-network retries."""
+def _format_elapsed_time(elapsed):
+    seconds = max(0, int(elapsed))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _pdf_upload_status_text(
+    label,
+    transferred,
+    total,
+    elapsed,
+    attempt,
+    *,
+    completed=False,
+):
+    total = max(int(total), 0)
+    transferred = min(max(int(transferred), 0), total)
+    percent = round((transferred / total) * 100) if total else 100
+    if completed:
+        heading = f"✅ Uploaded {label}."
+    elif total and transferred >= total:
+        heading = f"⬆️ Finishing {label} with Telegram…"
+    else:
+        heading = f"⬆️ Uploading {label}…"
+
+    progress = (
+        f"{_human_file_size(transferred)} / {_human_file_size(total)} "
+        f"({percent}%)"
+        if total
+        else "Waiting for Telegram…"
+    )
+    attempt_text = (
+        f"\nAttempt: {attempt}/{PDF_UPLOAD_ATTEMPTS}"
+        if attempt > 1
+        else ""
+    )
+    return (
+        f"{heading}\n"
+        f"Progress: {progress}\n"
+        f"Elapsed: {_format_elapsed_time(elapsed)}"
+        f"{attempt_text}"
+    )
+
+
+async def _upload_progress_ticker(
+    status,
+    tracked_file,
+    label,
+    attempt,
+    started_at,
+    finished,
+):
+    loop = asyncio.get_running_loop()
+    while not finished.is_set():
+        try:
+            await asyncio.wait_for(
+                finished.wait(),
+                timeout=PDF_UPLOAD_STATUS_INTERVAL,
+            )
+        except asyncio.TimeoutError:
+            await status.update(
+                _pdf_upload_status_text(
+                    label,
+                    tracked_file.transferred,
+                    tracked_file.total_bytes,
+                    loop.time() - started_at,
+                    attempt,
+                )
+            )
+
+
+async def _send_pdf_with_retry(message, output_path, label, *, status=None):
+    """Stream a PDF with byte progress and transient-network retries."""
+    output_path = Path(output_path)
+    total_bytes = output_path.stat().st_size
     for attempt in range(1, PDF_UPLOAD_ATTEMPTS + 1):
         try:
             # Reopen on every attempt because a failed upload may consume the
             # previous file object's stream.
             with output_path.open("rb") as pdf:
-                await message.reply_document(
-                    document=pdf,
+                tracked_file = _UploadProgressFile(pdf, total_bytes)
+                document = InputFile(
+                    tracked_file,
                     filename=output_path.name,
-                    caption=label,
-                    read_timeout=PDF_UPLOAD_READ_TIMEOUT,
-                    write_timeout=PDF_UPLOAD_WRITE_TIMEOUT,
-                    connect_timeout=PDF_UPLOAD_CONNECT_TIMEOUT,
-                    pool_timeout=PDF_UPLOAD_POOL_TIMEOUT,
+                    read_file_handle=False,
                 )
+                loop = asyncio.get_running_loop()
+                started_at = loop.time()
+                finished = asyncio.Event()
+                ticker = None
+                if status is not None:
+                    await status.update(
+                        _pdf_upload_status_text(
+                            label,
+                            0,
+                            total_bytes,
+                            0,
+                            attempt,
+                        ),
+                        force=True,
+                    )
+                    ticker = asyncio.create_task(
+                        _upload_progress_ticker(
+                            status,
+                            tracked_file,
+                            label,
+                            attempt,
+                            started_at,
+                            finished,
+                        )
+                    )
+                try:
+                    await message.reply_document(
+                        document=document,
+                        caption=label,
+                        read_timeout=PDF_UPLOAD_READ_TIMEOUT,
+                        write_timeout=PDF_UPLOAD_WRITE_TIMEOUT,
+                        connect_timeout=PDF_UPLOAD_CONNECT_TIMEOUT,
+                        pool_timeout=PDF_UPLOAD_POOL_TIMEOUT,
+                    )
+                finally:
+                    finished.set()
+                    if ticker is not None:
+                        await asyncio.gather(ticker, return_exceptions=True)
+
+                if status is not None:
+                    await status.update(
+                        _pdf_upload_status_text(
+                            label,
+                            total_bytes,
+                            total_bytes,
+                            loop.time() - started_at,
+                            attempt,
+                            completed=True,
+                        ),
+                        force=True,
+                    )
             return
         except RetryAfter as exc:
             if attempt == PDF_UPLOAD_ATTEMPTS:
@@ -1123,11 +1287,27 @@ async def _send_pdf_with_retry(message, output_path, label):
                 if hasattr(retry_after, "total_seconds")
                 else float(retry_after)
             )
-            await asyncio.sleep(delay + 1)
+            delay += 1
+            if status is not None:
+                await status.update(
+                    f"⏳ Telegram paused the {label} upload. "
+                    f"Retrying attempt {attempt + 1}/{PDF_UPLOAD_ATTEMPTS} "
+                    f"in {delay:.0f}s…",
+                    force=True,
+                )
+            await asyncio.sleep(delay)
         except NetworkError:
             if attempt == PDF_UPLOAD_ATTEMPTS:
                 raise
-            await asyncio.sleep(2 ** (attempt - 1))
+            delay = 2 ** (attempt - 1)
+            if status is not None:
+                await status.update(
+                    f"🔄 The {label} upload was interrupted. "
+                    f"Retrying attempt {attempt + 1}/{PDF_UPLOAD_ATTEMPTS} "
+                    f"in {delay}s…",
+                    force=True,
+                )
+            await asyncio.sleep(delay)
 
 
 def _pdf_split_process(input_path, duplex, output_dir, events):
@@ -1356,14 +1536,11 @@ async def split_pdf(
                 ("Color pages", result.color_path),
             ):
                 if output_path:
-                    await status.update(
-                        f"⬆️ Uploading {label}…",
-                        force=True,
-                    )
                     await _send_pdf_with_retry(
                         update.message,
                         output_path,
                         label,
+                        status=status,
                     )
             await status.update(
                 _split_completion_text(result, duplex),

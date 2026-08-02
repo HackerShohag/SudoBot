@@ -6,6 +6,7 @@ from unittest.mock import ANY, AsyncMock, patch
 from types import SimpleNamespace
 
 import fitz
+from telegram import InputFile
 from telegram.error import BadRequest, TimedOut
 
 from bot.utils import (
@@ -21,6 +22,7 @@ from bot.utils import (
     _find_replied_pdf_document,
     _recover_replied_group_pdf,
     _upload_file_path,
+    _split_completion_text,
     handle_file_upload,
     _send_pdf_with_retry,
     _split_pdf_with_progress,
@@ -53,6 +55,23 @@ class PdfCommandArgumentTests(unittest.TestCase):
 
     def test_upload_timeout_is_long_enough_for_pdf_files(self):
         self.assertGreaterEqual(PDF_UPLOAD_WRITE_TIMEOUT, 300)
+
+    def test_printing_guide_is_only_shown_for_duplex(self):
+        result = SplitResult(
+            bw_path=None,
+            color_path=None,
+            bw_pages=4,
+            color_pages=2,
+            guide="Manual printing guide",
+        )
+
+        simplex = _split_completion_text(result, False)
+        duplex = _split_completion_text(result, True)
+
+        self.assertNotIn("Printing guide", simplex)
+        self.assertNotIn("Manual printing guide", simplex)
+        self.assertIn("Printing guide", duplex)
+        self.assertIn("Manual printing guide", duplex)
 
 
 class RepliedPdfDiscoveryTests(unittest.TestCase):
@@ -135,6 +154,103 @@ class RepliedPdfDiscoveryTests(unittest.TestCase):
         )
 
 class PdfUploadRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pdf_upload_streams_real_byte_progress_to_one_status(self):
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "result.pdf"
+            output_path.write_bytes(b"0123456789")
+            halfway_reported = asyncio.Event()
+            status_texts = []
+            streamed_documents = []
+
+            async def record_status(text, force=False):
+                status_texts.append(text)
+                if "(50%)" in text:
+                    halfway_reported.set()
+                return True
+
+            async def upload_document(**kwargs):
+                document = kwargs["document"]
+                self.assertIsInstance(document, InputFile)
+                streamed_documents.append(document)
+                tracked_file = document.input_file_content
+                self.assertNotIsInstance(tracked_file, bytes)
+                tracked_file.seek(0)
+                self.assertEqual(tracked_file.read(5), b"01234")
+                await asyncio.wait_for(halfway_reported.wait(), timeout=1)
+                self.assertEqual(tracked_file.read(), b"56789")
+
+            message = SimpleNamespace(
+                reply_document=AsyncMock(side_effect=upload_document)
+            )
+            status = SimpleNamespace(
+                update=AsyncMock(side_effect=record_status)
+            )
+
+            with patch("bot.utils.PDF_UPLOAD_STATUS_INTERVAL", 0.001):
+                await _send_pdf_with_retry(
+                    message,
+                    output_path,
+                    "B&W pages",
+                    status=status,
+                )
+
+            self.assertEqual(len(streamed_documents), 1)
+            self.assertEqual(streamed_documents[0].filename, "result.pdf")
+            self.assertTrue(any("(0%)" in text for text in status_texts))
+            self.assertTrue(any("(50%)" in text for text in status_texts))
+            self.assertTrue(any("(100%)" in text for text in status_texts))
+            self.assertTrue(any("Elapsed:" in text for text in status_texts))
+            self.assertIn("Uploaded B&W pages", status_texts[-1])
+
+    async def test_pdf_upload_retry_resets_progress_and_shows_attempt(self):
+        with TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "result.pdf"
+            output_path.write_bytes(b"retry-data")
+            attempts = 0
+            status_texts = []
+
+            async def upload_document(**kwargs):
+                nonlocal attempts
+                attempts += 1
+                tracked_file = kwargs["document"].input_file_content
+                tracked_file.seek(0)
+                if attempts == 1:
+                    tracked_file.read(5)
+                    raise TimedOut("temporary upload failure")
+                tracked_file.read()
+
+            async def record_status(text, force=False):
+                status_texts.append(text)
+                return True
+
+            message = SimpleNamespace(
+                reply_document=AsyncMock(side_effect=upload_document)
+            )
+            status = SimpleNamespace(
+                update=AsyncMock(side_effect=record_status)
+            )
+
+            with patch(
+                "bot.utils.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
+                await _send_pdf_with_retry(
+                    message,
+                    output_path,
+                    "Color pages",
+                    status=status,
+                )
+
+            self.assertEqual(attempts, 2)
+            self.assertTrue(
+                any("Retrying attempt 2/3" in text for text in status_texts)
+            )
+            second_attempt = next(
+                text for text in status_texts if "Attempt: 2/3" in text
+            )
+            self.assertIn("(0%)", second_attempt)
+            self.assertIn("(100%)", status_texts[-1])
+
     async def test_pdf_upload_retries_timeouts(self):
         with TemporaryDirectory() as tmp:
             output_path = Path(tmp) / "result.pdf"
@@ -170,7 +286,12 @@ class PdfDownloadTests(unittest.IsolatedAsyncioTestCase):
         )
         context = SimpleNamespace(bot=SimpleNamespace(get_file=AsyncMock()))
 
-        with self.assertRaisesRegex(PdfDownloadError, "TELEGRAM_API_ID"):
+        with (
+            patch("bot.utils.TELEGRAM_API_ID", None),
+            patch("bot.utils.TELEGRAM_API_HASH", None),
+            patch("bot.utils._mtproto_downloader", None),
+            self.assertRaisesRegex(PdfDownloadError, "TELEGRAM_API_ID"),
+        ):
             await _download_pdf_document(context, document, 500, 42)
 
         context.bot.get_file.assert_not_awaited()
@@ -318,6 +439,9 @@ class PdfDownloadTests(unittest.IsolatedAsyncioTestCase):
 
             with (
                 patch("bot.utils.UPLOAD_DIR", tmp),
+                patch("bot.utils.TELEGRAM_API_ID", None),
+                patch("bot.utils.TELEGRAM_API_HASH", None),
+                patch("bot.utils._mtproto_downloader", None),
                 self.assertRaisesRegex(PdfDownloadError, "TELEGRAM_API_HASH"),
             ):
                 await _download_pdf_document(context, document, 500, 42)
@@ -394,6 +518,12 @@ class PdfProgressWorkflowTests(unittest.IsolatedAsyncioTestCase):
             guide="Manual printing guide\n" + ("detail\n" * 1000),
         )
 
+        async def fake_upload(_message, _path, label, *, status):
+            await status.update(
+                f"⬆️ Uploading {label}: 50%…",
+                force=True,
+            )
+
         with (
             patch("bot.utils.is_user_authorized", return_value=True),
             patch(
@@ -411,6 +541,7 @@ class PdfProgressWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as send_pdf,
         ):
+            send_pdf.side_effect = fake_upload
             await handle_file_upload(self.update(message), context)
 
         message.reply_text.assert_awaited_once()
@@ -429,6 +560,9 @@ class PdfProgressWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Manual printing guide", edits[-1])
         self.assertLessEqual(len(edits[-1]), 4096)
         self.assertEqual(send_pdf.await_count, 2)
+        first_status = send_pdf.await_args_list[0].kwargs["status"]
+        second_status = send_pdf.await_args_list[1].kwargs["status"]
+        self.assertIs(first_status, second_status)
 
     async def test_oversize_caption_shows_mtproto_setup_in_same_status(self):
         status_message = SimpleNamespace(
@@ -456,6 +590,9 @@ class PdfProgressWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("bot.utils.is_user_authorized", return_value=True),
+            patch("bot.utils.TELEGRAM_API_ID", None),
+            patch("bot.utils.TELEGRAM_API_HASH", None),
+            patch("bot.utils._mtproto_downloader", None),
             patch("bot.utils.split_pdf", new_callable=AsyncMock) as split,
         ):
             await handle_file_upload(self.update(message), context)
