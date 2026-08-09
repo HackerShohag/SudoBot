@@ -9,11 +9,16 @@ from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 from bot.keyboard import update_command_history
 from bot.utils import is_super_admin
 from bot.config import MAX_CHARS
+from bot.task_registry import (
+    cancel_chat_tasks,
+    has_stopping_tasks,
+    register_task,
+    unregister_task,
+)
 import signal
 import os
 
 AWAITING_SUDO_PASSWORD = 1
-running_process = None
 UPLOAD_DIR = "uploads"
 
 logger = logging.getLogger(__name__)
@@ -92,17 +97,38 @@ class _StatusMessage:
 
 @dataclass
 class _ActiveCommand:
-    process: object
-    status: _StatusMessage
+    chat_key: tuple[str, object]
     started_at: float
     subject: str = "Command"
+    task: asyncio.Task | None = None
+    process: object | None = None
+    status: _StatusMessage | None = None
     stdout: _OutputBuffer = field(default_factory=_OutputBuffer)
     stderr: _OutputBuffer = field(default_factory=_OutputBuffer)
     stop_requested: bool = False
+    spawning: bool = False
+    termination_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-_active_command = None
-_command_starting = False
+_active_commands: dict[tuple[str, object], _ActiveCommand] = {}
+
+
+def _command_chat_key(update) -> tuple[str, object]:
+    """Return a stable key so host commands and /stop stay chat-scoped."""
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        message = getattr(update, "message", None)
+        chat_id = getattr(message, "chat_id", None)
+    if chat_id is not None:
+        return ("chat", chat_id)
+
+    user = getattr(update, "effective_user", None)
+    if user is None:
+        message = getattr(update, "message", None)
+        user = getattr(message, "from_user", None)
+    user_id = getattr(user, "id", None)
+    return ("user", user_id if user_id is not None else id(update))
 
 
 async def _send_status(update, text: str, reply_to_message_id) -> _StatusMessage:
@@ -289,66 +315,77 @@ async def _terminate_process(process) -> None:
             return
         await process.wait()
 
-async def execute_command(
+
+async def _terminate_active_command(active: _ActiveCommand) -> None:
+    """Terminate one command once, even if /stop races the runner."""
+    async with active.termination_lock:
+        await _terminate_process(active.process)
+
+
+def _forget_active_command(active: _ActiveCommand) -> None:
+    if _active_commands.get(active.chat_key) is active:
+        _active_commands.pop(active.chat_key, None)
+
+
+async def _execute_active_command(
+    active: _ActiveCommand,
     command: str,
     update,
     context,
     reply_to_message_id,
-    *,
-    subject: str = "Command",
-):
-    global running_process, _active_command, _command_starting
-    if not is_super_admin(update.message.from_user):
-        await update.message.reply_text(
-            "❌ Only the super admin can run host commands."
-        )
-        return
-
-    if _command_starting or _active_command is not None or (
-        running_process is not None and running_process.returncode is None
-    ):
-        await update.message.reply_text(
-            "⚠️ Another host command is already running. Stop it with /stop first.",
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-
-    # Set this before the first await so two updates arriving together cannot
-    # both pass the availability check and overwrite the global process handle.
-    _command_starting = True
-    status = None
+) -> None:
+    """Own one reserved host command until its process and status are final."""
     loop = asyncio.get_running_loop()
-    started_at = loop.time()
     process = None
     wait_task = None
     drain_tasks = []
-    active = None
 
     try:
-        status = await _send_status(
+        # /stop can arrive immediately after /run, before this task gets its
+        # first event-loop turn. In that case no child should be spawned.
+        if active.stop_requested:
+            return
+
+        active.status = await _send_status(
             update,
             (
-                f"⠋ Running {subject.casefold()}…\n"
+                f"⠋ Running {active.subject.casefold()}…\n"
                 "Elapsed: 0s\n\n"
                 "Waiting for output…"
             ),
             reply_to_message_id,
         )
-        process = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-        running_process = process
-        active = _ActiveCommand(
-            process=process,
-            status=status,
-            started_at=started_at,
-            subject=subject,
-        )
-        _active_command = active
-        _command_starting = False
+
+        if active.stop_requested:
+            await _edit_status(
+                active.status,
+                _final_text(
+                    active.stdout,
+                    active.stderr,
+                    -signal.SIGTERM,
+                    loop.time() - active.started_at,
+                    stopped=True,
+                    subject=active.subject,
+                ),
+            )
+            return
+
+        active.spawning = True
+        try:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        finally:
+            active.spawning = False
+        active.process = process
+
+        # Close the narrow race where /stop arrives while Python is awaiting
+        # create_subprocess_shell and the process handle is not available yet.
+        if active.stop_requested:
+            await _terminate_active_command(active)
 
         try:
             update_command_history(update, context)
@@ -371,8 +408,11 @@ async def execute_command(
                 )
             except asyncio.TimeoutError:
                 frame += 1
-                elapsed = loop.time() - started_at
-                await _edit_status(status, _running_text(active, elapsed, frame))
+                elapsed = loop.time() - active.started_at
+                await _edit_status(
+                    active.status,
+                    _running_text(active, elapsed, frame),
+                )
 
         return_code = await wait_task
         drain_results = await asyncio.gather(*drain_tasks, return_exceptions=True)
@@ -380,61 +420,179 @@ async def execute_command(
             if isinstance(result, Exception):
                 active.stderr.append(f"\n[{stream_name} read failed: {result}]\n")
 
-        elapsed = loop.time() - started_at
+        elapsed = loop.time() - active.started_at
         await _edit_status(
-            status,
+            active.status,
             _final_text(
                 active.stdout,
                 active.stderr,
                 return_code,
                 elapsed,
                 stopped=active.stop_requested,
-                subject=subject,
+                subject=active.subject,
             ),
         )
     except asyncio.CancelledError:
-        await _terminate_process(process)
+        active.stop_requested = True
+        await _terminate_active_command(active)
+        if active.status is not None:
+            await _edit_status(
+                active.status,
+                _final_text(
+                    active.stdout,
+                    active.stderr,
+                    -signal.SIGTERM,
+                    loop.time() - active.started_at,
+                    stopped=True,
+                    subject=active.subject,
+                ),
+            )
         raise
     except Exception as exc:
         logger.exception("Command execution failed")
-        await _terminate_process(process)
-        elapsed = loop.time() - started_at
+        await _terminate_active_command(active)
         error_output = _OutputBuffer()
         error_output.append(str(exc))
-        if status is not None:
+        if active.status is not None:
             await _edit_status(
-                status,
+                active.status,
                 _final_text(
-                    _OutputBuffer(),
+                    active.stdout,
                     error_output,
                     -1,
-                    elapsed,
-                    stopped=False,
-                    subject=subject,
+                    loop.time() - active.started_at,
+                    stopped=active.stop_requested,
+                    subject=active.subject,
                 ),
             )
     finally:
-        if wait_task is not None and not wait_task.done():
-            wait_task.cancel()
-        for task in drain_tasks:
-            if not task.done():
-                task.cancel()
-        if wait_task is not None or drain_tasks:
-            await asyncio.gather(
-                *([wait_task] if wait_task is not None else []),
-                *drain_tasks,
-                return_exceptions=True,
-            )
+        async def cleanup():
+            if wait_task is not None and not wait_task.done():
+                wait_task.cancel()
+            for task in drain_tasks:
+                if not task.done():
+                    task.cancel()
+            if wait_task is not None or drain_tasks:
+                await asyncio.gather(
+                    *([wait_task] if wait_task is not None else []),
+                    *drain_tasks,
+                    return_exceptions=True,
+                )
+            await _terminate_active_command(active)
+
+        cleanup_task = asyncio.create_task(cleanup())
         try:
-            await _terminate_process(process)
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            # Cleanup is separately owned so a stop arriving during normal
+            # finalization cannot strand a process or its output-drain tasks.
+            await asyncio.shield(cleanup_task)
+            raise
         finally:
-            # Never leave a stale global behind, even if process cleanup itself
-            # encounters an unexpected platform-level error.
-            if running_process is process:
-                running_process = None
-            if _active_command is active:
-                _active_command = None
-            _command_starting = False
+            _forget_active_command(active)
+            unregister_task(update, active.task)
+
+
+async def _launch_command(
+    command: str,
+    update,
+    context,
+    reply_to_message_id,
+    *,
+    subject: str = "Command",
+) -> bool:
+    """Reserve a chat slot and detach command work from Telegram dispatch."""
+    if not is_super_admin(update.message.from_user):
+        await update.message.reply_text(
+            "❌ Only the super admin can run host commands."
+        )
+        return False
+
+    chat_key = _command_chat_key(update)
+    existing = _active_commands.get(chat_key)
+    if existing is not None:
+        await update.message.reply_text(
+            "⚠️ Another host command is already running in this chat. "
+            "Stop it with /stop first.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return False
+
+    # Reserve before the first await/task switch. This makes an immediately
+    # following /stop see the launch even before a subprocess handle exists.
+    active = _ActiveCommand(
+        chat_key=chat_key,
+        started_at=asyncio.get_running_loop().time(),
+        subject=subject,
+    )
+    _active_commands[chat_key] = active
+    coroutine = _execute_active_command(
+        active,
+        command,
+        update,
+        context,
+        reply_to_message_id,
+    )
+    try:
+        active.task = context.application.create_task(
+            coroutine,
+            update=update,
+            name=f"host-command:{chat_key[0]}:{chat_key[1]}",
+        )
+        active.task.add_done_callback(
+            lambda _completed: _forget_active_command(active)
+        )
+        register_task(update, active.task, "Host command")
+    except Exception:
+        coroutine.close()
+        _forget_active_command(active)
+        logger.exception("Could not schedule host command")
+        await update.message.reply_text(
+            "❌ The host command could not be scheduled."
+        )
+        return False
+    return True
+
+
+async def execute_command(
+    command: str,
+    update,
+    context,
+    reply_to_message_id,
+    *,
+    subject: str = "Command",
+):
+    """Run and await a host command (kept for direct/internal callers)."""
+    if not is_super_admin(update.message.from_user):
+        await update.message.reply_text(
+            "❌ Only the super admin can run host commands."
+        )
+        return
+
+    chat_key = _command_chat_key(update)
+    if chat_key in _active_commands:
+        await update.message.reply_text(
+            "⚠️ Another host command is already running in this chat. "
+            "Stop it with /stop first.",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    active = _ActiveCommand(
+        chat_key=chat_key,
+        started_at=asyncio.get_running_loop().time(),
+        subject=subject,
+        task=asyncio.current_task(),
+    )
+    _active_commands[chat_key] = active
+    register_task(update, active.task, "Host command")
+    await _execute_active_command(
+        active,
+        command,
+        update,
+        context,
+        reply_to_message_id,
+    )
 
 async def execute_on_file(update: Update, context: CallbackContext) -> None:
     if not is_super_admin(update.message.from_user):
@@ -458,7 +616,7 @@ async def execute_on_file(update: Update, context: CallbackContext) -> None:
     # Replace `{file}` with the actual file path
     command = command.replace("{file}", shlex.quote(file_path))
 
-    await execute_command(
+    await _launch_command(
         command,
         update,
         context,
@@ -481,68 +639,199 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if command.startswith("sudo"):
+        if _command_chat_key(update) in _active_commands:
+            await update.message.reply_text(
+                "⚠️ Another host command is already running in this chat. "
+                "Stop it with /stop first.",
+                reply_to_message_id=update.message.message_id,
+            )
+            return
         message = await update.message.reply_text("Enter your sudo password:", reply_to_message_id=update.message.message_id)
-        context.user_data['command'] = command
-        context.user_data['original_message_id'] = update.message.message_id
-        context.user_data['password_message_id'] = message.message_id
+        context.chat_data['sudo_command'] = command
+        context.chat_data['sudo_original_message_id'] = update.message.message_id
+        context.chat_data['sudo_password_message_id'] = message.message_id
         return AWAITING_SUDO_PASSWORD
 
-    await execute_command(command, update, context, update.message.message_id)
+    await _launch_command(
+        command,
+        update,
+        context,
+        update.message.message_id,
+    )
 
 async def password_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_super_admin(update.message.from_user):
-        context.user_data.pop('command', None)
-        context.user_data.pop('original_message_id', None)
-        context.user_data.pop('password_message_id', None)
+        context.chat_data.pop('sudo_command', None)
+        context.chat_data.pop('sudo_original_message_id', None)
+        context.chat_data.pop('sudo_password_message_id', None)
         await update.message.reply_text(
             "❌ Only the super admin can run host commands."
         )
         return ConversationHandler.END
 
     password = update.message.text
-    command = context.user_data.get('command')
-    original_message_id = context.user_data.get('original_message_id')
-    password_message_id = context.user_data.get('password_message_id')
+    command = context.chat_data.get('sudo_command')
+    original_message_id = context.chat_data.get('sudo_original_message_id')
+    password_message_id = context.chat_data.get('sudo_password_message_id')
 
     if not command:
         await update.message.reply_text("Error: No command found.", reply_to_message_id=update.message.message_id)
         return ConversationHandler.END
 
     full_command = f"echo {password} | sudo -S {command[5:]}"
-    
+
     await update.message.delete()
     await context.bot.delete_message(chat_id=update.message.chat_id, message_id=password_message_id)
-    await execute_command(full_command, update, context, original_message_id)
-    
+    context.chat_data.pop('sudo_command', None)
+    context.chat_data.pop('sudo_original_message_id', None)
+    context.chat_data.pop('sudo_password_message_id', None)
+    await _launch_command(
+        full_command,
+        update,
+        context,
+        original_message_id,
+    )
+
     return ConversationHandler.END
 
+
+async def _finish_stop_request(active: _ActiveCommand) -> None:
+    """Finish terminating the selected process group without blocking updates."""
+    try:
+        await _terminate_active_command(active)
+    except Exception:
+        logger.exception("Could not finish stopping host command")
+
+
+async def _mark_pending_pdf_prompt_stopped(context, chat_id, pending) -> None:
+    message_id = pending.get("prompt_message_id") if pending else None
+    if message_id is None:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="🛑 PDF upload request cancelled.",
+        )
+    except TelegramError:
+        logger.warning("Could not mark the pending PDF prompt as stopped")
+
+
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global running_process, _active_command
     if not is_super_admin(update.message.from_user):
         await update.message.reply_text(
-            "❌ Only the super admin can stop host commands."
+            "❌ Only the super admin can stop running tasks."
         )
-        return
+        return ConversationHandler.END
 
-    if running_process and running_process.returncode is None:
-        process = running_process
-        active = _active_command
-        if active is not None and active.process is process:
+    # /stop is also the fallback for the sudo-password conversation and clears
+    # a pending PDF re-upload prompt in this chat.
+    had_pending_sudo = bool(context.chat_data.get('sudo_command'))
+    pending_pdf = context.chat_data.get('pending_pdf_split')
+    had_pending_pdf = bool(pending_pdf)
+    context.chat_data.pop('sudo_command', None)
+    context.chat_data.pop('sudo_original_message_id', None)
+    context.chat_data.pop('sudo_password_message_id', None)
+    context.chat_data.pop('pending_pdf_split', None)
+
+    if had_pending_pdf:
+        coroutine = _mark_pending_pdf_prompt_stopped(
+            context,
+            update.effective_chat.id,
+            pending_pdf,
+        )
+        try:
+            context.application.create_task(
+                coroutine,
+                update=update,
+                name="stop-pending-pdf-prompt",
+            )
+        except Exception:
+            coroutine.close()
+            logger.warning("Could not schedule the pending PDF prompt update")
+
+    active = _active_commands.get(_command_chat_key(update))
+    host_stopping = False
+    already_stopping = False
+    excluded_tasks = {asyncio.current_task()}
+    if (
+        active is not None
+        and not (
+            active.process is not None
+            and active.process.returncode is not None
+        )
+    ):
+        already_stopping = active.stop_requested
+        if not already_stopping:
+            # Mark synchronously before yielding. If the child already exists,
+            # signal its process group immediately; the background finisher owns
+            # the grace period and SIGKILL escalation.
             active.stop_requested = True
+            host_stopping = True
+            process = active.process
+            if process is not None and process.returncode is None:
+                try:
+                    _signal_process(process, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+            # Cancellation during create_subprocess_shell can lose a newly
+            # created child before Python exposes its handle. Let the runner's
+            # post-spawn stop check own that narrow phase.
+            if active.spawning and active.task is not None:
+                excluded_tasks.add(active.task)
+
+    cancelled = cancel_chat_tasks(
+        update,
+        exclude=excluded_tasks,
+    )
+    host_task_cancelled = bool(
+        active is not None
+        and any(task is active.task for task, _label in cancelled)
+    )
+
+    # A host runner created by an internal caller may not be cancellable. Its
+    # process was already signalled above, so finish the grace-period handling
+    # without blocking Telegram update processing.
+    if (
+        host_stopping
+        and not host_task_cancelled
+        and active is not None
+        and not active.spawning
+    ):
+        coroutine = _finish_stop_request(active)
         try:
-            _signal_process(process, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(process.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            try:
-                _signal_process(process, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            else:
-                await process.wait()
-        # execute_command owns the status message and will turn it into the final
-        # stopped result.  Avoid emitting a second completion message here.
+            context.application.create_task(
+                coroutine,
+                update=update,
+                name=(
+                    "stop-host-command:"
+                    f"{active.chat_key[0]}:{active.chat_key[1]}"
+                ),
+            )
+        except Exception:
+            coroutine.close()
+            logger.exception("Could not schedule host-command termination")
+            await _terminate_active_command(active)
+
+    stopped_count = (
+        int(host_stopping and not host_task_cancelled)
+        + len(cancelled)
+        + int(had_pending_sudo)
+        + int(had_pending_pdf)
+    )
+    if stopped_count:
+        noun = "task" if stopped_count == 1 else "tasks"
+        await update.message.reply_text(
+            f"🛑 Stopping all running work in this chat ({stopped_count} {noun})."
+        )
+    elif already_stopping or has_stopping_tasks(update):
+        await update.message.reply_text(
+            "🛑 Running work in this chat is already stopping."
+        )
     else:
-        await update.message.reply_text("⚠️ No command is currently running.")
+        await update.message.reply_text(
+            "⚠️ No running tasks were found in this chat."
+        )
+
+    return ConversationHandler.END

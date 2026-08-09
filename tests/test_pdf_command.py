@@ -1,14 +1,17 @@
 import asyncio
+import queue
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import fitz
 from telegram import InputFile
 from telegram.error import BadRequest, TimedOut
 
+import bot.utils as pdf_utils
+from bot import task_registry
 from bot.mtproto import MtprotoConfigurationError, MtprotoDocument
 from bot.utils import (
     PDF_DOWNLOAD_LIMIT_BYTES,
@@ -76,6 +79,167 @@ class PdfCommandArgumentTests(unittest.TestCase):
         self.assertNotIn("Manual printing guide", simplex)
         self.assertIn("Printing guide", duplex)
         self.assertIn("Manual printing guide", duplex)
+
+
+class PdfJobConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        pdf_utils._active_pdf_jobs.clear()
+        task_registry._CHAT_TASKS.clear()
+
+    async def asyncTearDown(self):
+        pending = [
+            task
+            for tasks in task_registry._CHAT_TASKS.values()
+            for task in tasks
+            if not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        pdf_utils._active_pdf_jobs.clear()
+        task_registry._CHAT_TASKS.clear()
+
+    async def test_second_pdf_job_in_same_chat_is_rejected_without_overlap(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_pdf_job(*_args, **_kwargs):
+            started.set()
+            await release.wait()
+            return True
+
+        def objects(message_id):
+            message = SimpleNamespace(
+                message_id=message_id,
+                chat_id=500,
+                reply_text=AsyncMock(),
+            )
+            update = SimpleNamespace(
+                message=message,
+                effective_chat=SimpleNamespace(id=500),
+            )
+            context = SimpleNamespace(args=[], user_data={}, chat_data={})
+            return update, context
+
+        first_update, first_context = objects(10)
+        second_update, second_context = objects(11)
+
+        with patch(
+            "bot.utils._split_pdf_result",
+            new=AsyncMock(side_effect=slow_pdf_job),
+        ) as split_result:
+            first_task = asyncio.create_task(
+                split_pdf(first_update, first_context)
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            await split_pdf(second_update, second_context)
+            release.set()
+            await asyncio.wait_for(first_task, timeout=1)
+
+        self.assertEqual(split_result.await_count, 1)
+        second_update.message.reply_text.assert_awaited_once_with(
+            "⚠️ PDF processing is already running in this chat. "
+            "Please wait for it to finish."
+        )
+        self.assertEqual(pdf_utils._active_pdf_jobs, {})
+
+    async def test_cancelled_pdf_uses_same_status_and_releases_all_tracking(self):
+        started = asyncio.Event()
+        status_message = SimpleNamespace(
+            message_id=700,
+            edit_text=AsyncMock(),
+        )
+        status = _PdfStatus(message=status_message)
+        message = SimpleNamespace(
+            message_id=10,
+            chat_id=500,
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            message=message,
+            effective_chat=SimpleNamespace(id=500),
+        )
+        context = SimpleNamespace(args=[], user_data={}, chat_data={})
+
+        async def blocked_pdf_job(*_args, **_kwargs):
+            pdf_utils._set_pdf_job_status(update, status)
+            started.set()
+            await asyncio.Event().wait()
+
+        with patch(
+            "bot.utils._split_pdf_result",
+            new=AsyncMock(side_effect=blocked_pdf_job),
+        ):
+            task = asyncio.create_task(split_pdf(update, context))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            self.assertEqual(
+                task_registry.tracked_tasks(update),
+                {task: "PDF processing"},
+            )
+
+            cancelled = task_registry.cancel_chat_tasks(update)
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0)
+
+        self.assertEqual(cancelled, [(task, "PDF processing")])
+        self.assertTrue(task.cancelled())
+        status_message.edit_text.assert_awaited_once_with(
+            "🛑 PDF processing stopped."
+        )
+        message.reply_text.assert_not_awaited()
+        self.assertEqual(pdf_utils._active_pdf_jobs, {})
+        self.assertEqual(task_registry.tracked_tasks(update), {})
+
+    async def test_cancelled_split_terminates_and_closes_worker_immediately(self):
+        class Worker:
+            def __init__(self):
+                self.alive = True
+                self.started = False
+                self.terminate = Mock(side_effect=self._terminate)
+                self.kill = Mock(side_effect=self._kill)
+                self.close = Mock()
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return self.alive
+
+            def _terminate(self):
+                self.alive = False
+
+            def _kill(self):
+                self.alive = False
+
+        worker = Worker()
+        events = SimpleNamespace(
+            get_nowait=Mock(side_effect=queue.Empty),
+            close=Mock(),
+        )
+        process_context = SimpleNamespace(
+            Queue=Mock(return_value=events),
+            Process=Mock(return_value=worker),
+        )
+        status = SimpleNamespace(update=AsyncMock())
+
+        with patch(
+            "bot.utils.multiprocessing.get_context",
+            return_value=process_context,
+        ):
+            task = asyncio.create_task(
+                _split_pdf_with_progress("source.pdf", False, "out", status)
+            )
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        self.assertTrue(task.cancelled())
+        self.assertTrue(worker.started)
+        worker.terminate.assert_called_once_with()
+        worker.kill.assert_not_called()
+        worker.close.assert_called_once_with()
+        events.close.assert_called_once_with()
 
 
 class RepliedPdfDiscoveryTests(unittest.TestCase):
@@ -1315,7 +1479,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(handler_result)
         self.assertEqual(
-            context.user_data["pending_pdf_split"],
+            context.chat_data["pending_pdf_split"],
             {
                 "args": ["--duplex"],
                 "chat_id": 500,
@@ -1347,14 +1511,14 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 get_file=AsyncMock(return_value=telegram_file),
                 edit_message_text=AsyncMock(),
             ),
-            user_data={
+            user_data={},
+            chat_data={
                 "pending_pdf_split": {
                     "args": ["--duplex"],
                     "chat_id": 500,
                     "prompt_message_id": 700,
                 }
             },
-            chat_data={},
         )
         update = self.update(message)
 
@@ -1382,7 +1546,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "Downloading selected PDF",
             context.bot.edit_message_text.await_args.kwargs["text"],
         )
-        self.assertNotIn("pending_pdf_split", context.user_data)
+        self.assertNotIn("pending_pdf_split", context.chat_data)
 
     async def test_explicit_group_reply_never_uses_private_last_upload(self):
         prompt_message = SimpleNamespace(
@@ -1424,7 +1588,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
         ):
             await split_pdf(self.update(message, chat_id=-500), context)
 
-        self.assertIn("pending_pdf_split", context.user_data)
+        self.assertIn("pending_pdf_split", context.chat_data)
         message.reply_text.assert_awaited_once_with(
             "🔎 Locating the selected PDF…"
         )
@@ -1478,20 +1642,20 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         context = SimpleNamespace(
             bot=SimpleNamespace(get_file=AsyncMock()),
-            user_data={
+            user_data={},
+            chat_data={
                 "pending_pdf_split": {
                     "args": [],
                     "chat_id": -500,
                     "prompt_message_id": 700,
                 }
             },
-            chat_data={},
         )
 
         await handle_file_upload(self.update(message, chat_id=-500), context)
 
         context.bot.get_file.assert_not_awaited()
-        self.assertIn("pending_pdf_split", context.user_data)
+        self.assertIn("pending_pdf_split", context.chat_data)
 
     async def test_inaccessible_group_pdf_is_recovered_by_private_forward(self):
         document = SimpleNamespace(

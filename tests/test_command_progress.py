@@ -1,4 +1,5 @@
 import asyncio
+import signal
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -6,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 from telegram.error import RetryAfter
 
 import bot.bot as command_bot
+from bot import task_registry
 
 
 class FakeStream:
@@ -62,24 +64,78 @@ class StoppableFakeProcess(FakeProcess):
         self._finished.set()
 
 
-def command_objects():
-    status_message = SimpleNamespace(edit_text=AsyncMock())
+class TaskTrackingApplication:
+    """Small stand-in for PTB's synchronous Application.create_task API."""
+
+    def __init__(self):
+        self.tasks = []
+
+    def create_task(self, coroutine, *, update=None, name=None):
+        task = asyncio.create_task(coroutine, name=name)
+        self.tasks.append(task)
+        return task
+
+    async def wait_for_all(self):
+        while True:
+            pending = [task for task in self.tasks if not task.done()]
+            if not pending:
+                return
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+def command_objects(*, chat_id=100, application=None):
+    application = application or TaskTrackingApplication()
+    status_message = SimpleNamespace(message_id=11, edit_text=AsyncMock())
+    user = SimpleNamespace(id=1, username="hackershohag")
     message = SimpleNamespace(
-        from_user=SimpleNamespace(id=1, username="hackershohag"),
+        from_user=user,
+        chat_id=chat_id,
         message_id=10,
         text="/run test",
         reply_text=AsyncMock(return_value=status_message),
+        delete=AsyncMock(),
     )
-    update = SimpleNamespace(message=message)
-    context = SimpleNamespace(args=[], user_data={})
+    update = SimpleNamespace(
+        message=message,
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=user,
+    )
+    context = SimpleNamespace(
+        args=[],
+        user_data={},
+        chat_data={},
+        application=application,
+        bot=SimpleNamespace(delete_message=AsyncMock()),
+    )
     return update, context, status_message
 
 
 class CommandProgressTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        command_bot.running_process = None
-        command_bot._active_command = None
-        command_bot._command_starting = False
+        command_bot._active_commands.clear()
+        task_registry._CHAT_TASKS.clear()
+
+    async def asyncTearDown(self):
+        tasks = []
+        for active in list(command_bot._active_commands.values()):
+            active.stop_requested = True
+            if active.task is not None and not active.task.done():
+                active.task.cancel()
+                tasks.append(active.task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        command_bot._active_commands.clear()
+        registry_tasks = [
+            task
+            for tracked in task_registry._CHAT_TASKS.values()
+            for task in tracked
+            if not task.done()
+        ]
+        for task in registry_tasks:
+            task.cancel()
+        if registry_tasks:
+            await asyncio.gather(*registry_tasks, return_exceptions=True)
+        task_registry._CHAT_TASKS.clear()
 
     async def test_no_output_finishes_in_the_original_status_message(self):
         update, context, status_message = command_objects()
@@ -100,7 +156,7 @@ class CommandProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("✅ Command completed", final_text)
         self.assertIn("Exit code: 0", final_text)
         self.assertEqual(final_text.count("(no output)"), 2)
-        self.assertIsNone(command_bot.running_process)
+        self.assertNotIn(("chat", 100), command_bot._active_commands)
 
     async def test_stdout_and_stderr_are_drained_concurrently(self):
         update, context, status_message = command_objects()
@@ -211,6 +267,7 @@ class CommandProgressTests(unittest.IsolatedAsyncioTestCase):
             ) as create_process,
         ):
             await command_bot.execute_on_file(update, context)
+            await context.application.wait_for_all()
 
         create_process.assert_awaited_once_with(
             "cat uploads/input.txt",
@@ -227,8 +284,12 @@ class CommandProgressTests(unittest.IsolatedAsyncioTestCase):
     async def test_second_command_is_rejected_without_overwriting_active_process(self):
         update, context, _status_message = command_objects()
         active_process = FakeProcess(delay=10)
-        command_bot.running_process = active_process
-        command_bot._active_command = SimpleNamespace(process=active_process)
+        active = command_bot._ActiveCommand(
+            chat_key=("chat", 100),
+            started_at=asyncio.get_running_loop().time(),
+            process=active_process,
+        )
+        command_bot._active_commands[active.chat_key] = active
 
         with (
             patch("bot.bot.is_super_admin", return_value=True),
@@ -241,14 +302,21 @@ class CommandProgressTests(unittest.IsolatedAsyncioTestCase):
 
         create_process.assert_not_awaited()
         update.message.reply_text.assert_awaited_once_with(
-            "⚠️ Another host command is already running. Stop it with /stop first.",
+            "⚠️ Another host command is already running in this chat. "
+            "Stop it with /stop first.",
             reply_to_message_id=10,
         )
-        self.assertIs(command_bot.running_process, active_process)
+        self.assertIs(command_bot._active_commands[active.chat_key], active)
 
-    async def test_stop_finishes_by_editing_the_active_status_only(self):
-        run_update, context, status_message = command_objects()
-        stop_update, stop_context, _ = command_objects()
+    async def test_run_returns_immediately_and_stop_interrupts_active_process(self):
+        application = TaskTrackingApplication()
+        run_update, context, status_message = command_objects(
+            application=application
+        )
+        stop_update, stop_context, _ = command_objects(
+            application=application
+        )
+        context.args = ["long-running"]
         process = StoppableFakeProcess()
 
         with (
@@ -260,20 +328,247 @@ class CommandProgressTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=process),
             ),
         ):
-            command_task = asyncio.create_task(
-                command_bot.execute_command("long-running", run_update, context, 10)
+            await asyncio.wait_for(
+                command_bot.run_command(run_update, context),
+                timeout=0.1,
             )
-            for _ in range(20):
-                if command_bot.running_process is process:
+            active = command_bot._active_commands[("chat", 100)]
+            self.assertIsNotNone(active.task)
+            self.assertFalse(active.task.done())
+
+            for _ in range(50):
+                if active.process is process:
                     break
                 await asyncio.sleep(0)
-            await command_bot.stop_command(stop_update, stop_context)
-            await asyncio.wait_for(command_task, timeout=1)
+            self.assertIs(active.process, process)
 
-        stop_update.message.reply_text.assert_not_awaited()
+            await command_bot.stop_command(stop_update, stop_context)
+            await asyncio.wait_for(application.wait_for_all(), timeout=1)
+
+        stop_update.message.reply_text.assert_awaited_once_with(
+            "🛑 Stopping all running work in this chat (1 task)."
+        )
+        self.assertIn(signal.SIGTERM, process.signals)
         final_text = status_message.edit_text.await_args_list[-1].args[0]
         self.assertIn("🛑 Command stopped", final_text)
-        self.assertIsNone(command_bot.running_process)
+        self.assertNotIn(("chat", 100), command_bot._active_commands)
+
+    async def test_immediate_stop_before_runner_starts_prevents_subprocess_spawn(self):
+        application = TaskTrackingApplication()
+        run_update, run_context, _ = command_objects(application=application)
+        stop_update, stop_context, _ = command_objects(application=application)
+        run_context.args = ["must-not-start"]
+
+        with (
+            patch("bot.bot.is_super_admin", return_value=True),
+            patch(
+                "bot.bot.asyncio.create_subprocess_shell",
+                new_callable=AsyncMock,
+            ) as create_process,
+        ):
+            # Neither callback yields on this path. /stop therefore marks the
+            # reserved slot before the newly scheduled runner gets a turn.
+            await command_bot.run_command(run_update, run_context)
+            active = command_bot._active_commands[("chat", 100)]
+            self.assertIsNone(active.process)
+            await command_bot.stop_command(stop_update, stop_context)
+            await asyncio.wait_for(application.wait_for_all(), timeout=1)
+
+        create_process.assert_not_awaited()
+        stop_update.message.reply_text.assert_awaited_once_with(
+            "🛑 Stopping all running work in this chat (1 task)."
+        )
+        self.assertNotIn(("chat", 100), command_bot._active_commands)
+
+    async def test_stop_is_scoped_to_the_chat_that_requested_it(self):
+        application = TaskTrackingApplication()
+        update_a, context_a, _ = command_objects(
+            chat_id=100,
+            application=application,
+        )
+        update_b, context_b, _ = command_objects(
+            chat_id=200,
+            application=application,
+        )
+        unrelated_stop, unrelated_context, _ = command_objects(
+            chat_id=300,
+            application=application,
+        )
+        stop_a, stop_context_a, _ = command_objects(
+            chat_id=100,
+            application=application,
+        )
+        stop_b, stop_context_b, _ = command_objects(
+            chat_id=200,
+            application=application,
+        )
+        context_a.args = ["command-a"]
+        context_b.args = ["command-b"]
+        process_a = StoppableFakeProcess()
+        process_b = StoppableFakeProcess()
+
+        with (
+            patch("bot.bot.is_super_admin", return_value=True),
+            patch("bot.bot.update_command_history"),
+            patch(
+                "bot.bot.asyncio.create_subprocess_shell",
+                new=AsyncMock(side_effect=[process_a, process_b]),
+            ),
+        ):
+            await command_bot.run_command(update_a, context_a)
+            await command_bot.run_command(update_b, context_b)
+
+            for _ in range(50):
+                active_a = command_bot._active_commands.get(("chat", 100))
+                active_b = command_bot._active_commands.get(("chat", 200))
+                if (
+                    active_a is not None
+                    and active_a.process is process_a
+                    and active_b is not None
+                    and active_b.process is process_b
+                ):
+                    break
+                await asyncio.sleep(0)
+            self.assertIs(active_a.process, process_a)
+            self.assertIs(active_b.process, process_b)
+
+            await command_bot.stop_command(unrelated_stop, unrelated_context)
+            self.assertEqual(process_a.signals, [])
+            self.assertEqual(process_b.signals, [])
+            unrelated_stop.message.reply_text.assert_awaited_once_with(
+                "⚠️ No running tasks were found in this chat."
+            )
+
+            await command_bot.stop_command(stop_a, stop_context_a)
+            self.assertIn(signal.SIGTERM, process_a.signals)
+            self.assertEqual(process_b.signals, [])
+
+            await asyncio.wait_for(
+                asyncio.gather(
+                    command_bot._active_commands[("chat", 100)].task,
+                    return_exceptions=True,
+                ),
+                timeout=1,
+            )
+            self.assertNotIn(("chat", 100), command_bot._active_commands)
+            self.assertIn(("chat", 200), command_bot._active_commands)
+
+            await command_bot.stop_command(stop_b, stop_context_b)
+            await asyncio.wait_for(application.wait_for_all(), timeout=1)
+
+        self.assertIn(signal.SIGTERM, process_b.signals)
+        self.assertEqual(command_bot._active_commands, {})
+
+    async def test_sudo_prompt_and_stop_state_are_scoped_by_chat(self):
+        application = TaskTrackingApplication()
+        update_a, context_a, _ = command_objects(
+            chat_id=100,
+            application=application,
+        )
+        update_b, context_b, _ = command_objects(
+            chat_id=200,
+            application=application,
+        )
+        stop_a, stop_context_a, _ = command_objects(
+            chat_id=100,
+            application=application,
+        )
+        context_a.args = ["sudo", "whoami"]
+        context_b.args = ["sudo", "id"]
+        stop_context_a.chat_data = context_a.chat_data
+
+        with patch("bot.bot.is_super_admin", return_value=True):
+            await command_bot.run_command(update_a, context_a)
+            await command_bot.run_command(update_b, context_b)
+
+            self.assertEqual(context_a.chat_data["sudo_command"], "sudo whoami")
+            self.assertEqual(context_b.chat_data["sudo_command"], "sudo id")
+
+            await command_bot.stop_command(stop_a, stop_context_a)
+
+        self.assertEqual(context_a.chat_data, {})
+        self.assertEqual(context_b.chat_data["sudo_command"], "sudo id")
+
+    async def test_stop_cancels_all_tracked_work_in_chat_but_not_other_chat(self):
+        update, context, _ = command_objects(chat_id=100)
+        other_update, _, _ = command_objects(chat_id=200)
+        same_chat_started = [asyncio.Event(), asyncio.Event()]
+        other_chat_started = asyncio.Event()
+        cleanup_seen = [asyncio.Event(), asyncio.Event()]
+
+        async def work(started, cleaned=None):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                if cleaned is not None:
+                    cleaned.set()
+
+        same_chat_tasks = [
+            asyncio.create_task(work(started, cleaned))
+            for started, cleaned in zip(same_chat_started, cleanup_seen)
+        ]
+        other_chat_task = asyncio.create_task(work(other_chat_started))
+        task_registry.register_task(update, same_chat_tasks[0], "PDF processing")
+        task_registry.register_task(update, same_chat_tasks[1], "System monitor")
+        task_registry.register_task(other_update, other_chat_task, "System usage")
+        await asyncio.gather(
+            *(event.wait() for event in same_chat_started),
+            other_chat_started.wait(),
+        )
+
+        with patch("bot.bot.is_super_admin", return_value=True):
+            await command_bot.stop_command(update, context)
+        await asyncio.gather(*same_chat_tasks, return_exceptions=True)
+
+        self.assertTrue(all(task.cancelled() for task in same_chat_tasks))
+        self.assertTrue(all(event.is_set() for event in cleanup_seen))
+        self.assertFalse(other_chat_task.done())
+        update.message.reply_text.assert_awaited_once_with(
+            "🛑 Stopping all running work in this chat (2 tasks)."
+        )
+        self.assertEqual(task_registry.tracked_tasks(update), {})
+        self.assertEqual(
+            task_registry.tracked_tasks(other_update),
+            {other_chat_task: "System usage"},
+        )
+
+        other_chat_task.cancel()
+        await asyncio.gather(other_chat_task, return_exceptions=True)
+
+    async def test_second_stop_does_not_cancel_cleaning_task_again(self):
+        update, context, _ = command_objects(chat_id=100)
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+
+        async def work():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await cleanup_release.wait()
+                raise
+
+        task = asyncio.create_task(work())
+        task_registry.register_task(update, task, "PDF processing")
+        await asyncio.sleep(0)
+
+        with patch("bot.bot.is_super_admin", return_value=True):
+            await command_bot.stop_command(update, context)
+            await cleanup_started.wait()
+            await command_bot.stop_command(update, context)
+
+        self.assertEqual(task.cancelling(), 1)
+        self.assertEqual(
+            [call.args[0] for call in update.message.reply_text.await_args_list],
+            [
+                "🛑 Stopping all running work in this chat (1 task).",
+                "🛑 Running work in this chat is already stopping.",
+            ],
+        )
+
+        cleanup_release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 if __name__ == "__main__":

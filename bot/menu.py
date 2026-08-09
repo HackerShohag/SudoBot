@@ -12,6 +12,11 @@ from telegram.error import NetworkError, RetryAfter
 from telegram.ext import ContextTypes
 
 from bot.utils import is_user_authorized
+from bot.task_registry import (
+    register_current_task,
+    register_task,
+    unregister_task,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -19,7 +24,7 @@ UPLOAD_DIR = "uploads"
 GIB = 1024**3
 PUBLIC_IP_TIMEOUT_SECONDS = 10
 MONITOR_DURATION_SECONDS = 5 * 60
-MONITOR_INTERVAL_SECONDS = 10
+MONITOR_INTERVAL_SECONDS = 1.0
 NETWORK_EDIT_RETRY_SECONDS = 1
 _ACTIVE_MONITORS = {}
 
@@ -241,7 +246,7 @@ async def _edit_message_with_retry(message, text, attempts=2):
 async def set_bot_menu(application):
     commands = [
         BotCommand("run", "Run a command"),
-        BotCommand("stop", "Stop the running command"),
+        BotCommand("stop", "Stop all running work in this chat"),
         BotCommand("splitpdf", "Split PDFs or a replied PDF album"),
         BotCommand("authorize", "Authorize a user (admins)"),
         BotCommand("unauthorize", "Revoke user access (admins)"),
@@ -256,87 +261,107 @@ async def set_bot_menu(application):
     await application.bot.set_my_commands(commands)
 
 
-async def get_local_ip(update: Update, context) -> None:
+async def _run_status_command(
+    update,
+    initial_text,
+    collector,
+    *,
+    label,
+    error_label,
+    render=lambda value: value,
+):
     if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to run commands.")
         return
 
-    status = await update.message.reply_text("⏳ Looking up the local IP...")
+    task = register_current_task(update, label)
+    status = None
     try:
-        local_ip = await asyncio.to_thread(_find_local_ip)
-        await _edit_message_with_retry(status, f"Your local IP is: {local_ip}")
+        status = await update.message.reply_text(initial_text)
+        response = await asyncio.to_thread(collector)
+        await _edit_message_with_retry(status, render(response))
+    except asyncio.CancelledError:
+        if status is not None:
+            await asyncio.shield(
+                _edit_message_with_retry(status, f"🛑 {label} stopped.")
+            )
+        raise
     except Exception as exc:
-        await _edit_message_with_retry(status, f"Error retrieving local IP: {exc}")
+        if status is not None:
+            await _edit_message_with_retry(
+                status,
+                f"{error_label}: {exc}",
+            )
+    finally:
+        unregister_task(update, task)
+
+
+async def get_local_ip(update: Update, context) -> None:
+    await _run_status_command(
+        update,
+        "⏳ Looking up the local IP...",
+        _find_local_ip,
+        label="Local IP lookup",
+        error_label="Error retrieving local IP",
+        render=lambda value: f"Your local IP is: {value}",
+    )
 
 
 async def get_system_info(update: Update, context) -> None:
-    if not is_user_authorized(update.message.from_user):
-        await update.message.reply_text("❌ You are not authorized to run commands.")
-        return
-
-    status = await update.message.reply_text("⏳ Collecting system information...")
-    try:
-        response = await asyncio.to_thread(_collect_system_information)
-        await _edit_message_with_retry(status, response)
-    except Exception as exc:
-        await _edit_message_with_retry(status, f"Error retrieving system info: {exc}")
+    await _run_status_command(
+        update,
+        "⏳ Collecting system information...",
+        _collect_system_information,
+        label="System information",
+        error_label="Error retrieving system info",
+    )
 
 
 async def get_disk_usage(update: Update, context) -> None:
-    if not is_user_authorized(update.message.from_user):
-        await update.message.reply_text("❌ You are not authorized to run commands.")
-        return
-
-    status = await update.message.reply_text("⏳ Checking disk usage...")
-    try:
-        response = await asyncio.to_thread(_collect_disk_usage)
-        await _edit_message_with_retry(status, response)
-    except Exception as exc:
-        await _edit_message_with_retry(status, f"Error retrieving disk usage: {exc}")
+    await _run_status_command(
+        update,
+        "⏳ Checking disk usage...",
+        _collect_disk_usage,
+        label="Disk usage check",
+        error_label="Error retrieving disk usage",
+    )
 
 
 async def get_public_ip(update: Update, context) -> None:
-    if not is_user_authorized(update.message.from_user):
-        await update.message.reply_text("❌ You are not authorized to run commands.")
-        return
-
-    status = await update.message.reply_text("⏳ Looking up the public IP...")
-    try:
-        public_ip = await asyncio.to_thread(_fetch_public_ip)
-        await _edit_message_with_retry(status, f"Your public IP is: {public_ip}")
-    except Exception as exc:
-        await _edit_message_with_retry(status, f"Error retrieving public IP: {exc}")
+    await _run_status_command(
+        update,
+        "⏳ Looking up the public IP...",
+        _fetch_public_ip,
+        label="Public IP lookup",
+        error_label="Error retrieving public IP",
+        render=lambda value: f"Your public IP is: {value}",
+    )
 
 
 async def get_system_usage(update: Update, context) -> None:
-    if not is_user_authorized(update.message.from_user):
-        await update.message.reply_text("❌ You are not authorized to run commands.")
-        return
-
-    status = await update.message.reply_text("⏳ Measuring system usage...")
-    try:
-        response = await asyncio.to_thread(_collect_system_usage)
-        await _edit_message_with_retry(status, response)
-    except Exception as exc:
-        await _edit_message_with_retry(status, f"Error retrieving system usage: {exc}")
+    await _run_status_command(
+        update,
+        "⏳ Measuring system usage...",
+        _collect_system_usage,
+        label="System usage check",
+        error_label="Error retrieving system usage",
+    )
 
 
 async def get_machine_specs(update: Update, context) -> None:
-    if not is_user_authorized(update.message.from_user):
-        await update.message.reply_text("❌ You are not authorized to run commands.")
-        return
-
-    status = await update.message.reply_text("⏳ Collecting machine specifications...")
-    try:
-        response = await asyncio.to_thread(_collect_machine_specs)
-        await _edit_message_with_retry(status, response)
-    except Exception as exc:
-        await _edit_message_with_retry(status, f"Error retrieving machine specs: {exc}")
+    await _run_status_command(
+        update,
+        "⏳ Collecting machine specifications...",
+        _collect_machine_specs,
+        label="Machine specifications",
+        error_label="Error retrieving machine specs",
+    )
 
 
 async def _run_usage_monitor(message):
     loop = asyncio.get_running_loop()
     end_time = loop.time() + MONITOR_DURATION_SECONDS
+    next_tick = loop.time()
 
     try:
         while loop.time() < end_time:
@@ -347,13 +372,22 @@ async def _run_usage_monitor(message):
                 f"🟢 Monitoring system usage — {minutes:02d}:{seconds:02d} remaining\n"
                 f"{usage}"
             )
-            if not await _edit_message_with_retry(message, response):
-                return
+            await _edit_message_with_retry(message, response)
 
-            await asyncio.sleep(min(MONITOR_INTERVAL_SECONDS, max(end_time - loop.time(), 0)))
+            next_tick += MONITOR_INTERVAL_SECONDS
+            now = loop.time()
+            if next_tick <= now:
+                # A slow Telegram edit or RetryAfter missed this tick. Resume
+                # one interval from now instead of emitting a catch-up burst.
+                next_tick = now + MONITOR_INTERVAL_SECONDS
+            delay = max(next_tick - now, 0)
+            await asyncio.sleep(min(delay, max(end_time - loop.time(), 0)))
 
         await _edit_message_with_retry(message, "🛑 Stopped monitoring system usage.")
     except asyncio.CancelledError:
+        await asyncio.shield(
+            _edit_message_with_retry(message, "🛑 System monitoring stopped.")
+        )
         raise
     except Exception as exc:
         LOGGER.exception("System-usage monitoring failed")
@@ -394,9 +428,29 @@ async def monitor_system_usage(
         )
         return
 
-    message = await update.message.reply_text(
-        "🟢 Starting system monitor — gathering the first reading..."
+    startup_task = asyncio.create_task(
+        update.message.reply_text(
+            "🟢 Starting system monitor — gathering the first reading..."
+        )
     )
+    try:
+        message = await asyncio.shield(startup_task)
+    except asyncio.CancelledError:
+        # Let the in-flight Telegram request resolve so a delivered startup
+        # message never remains permanently active-looking after /stop.
+        try:
+            message = await asyncio.shield(startup_task)
+        except Exception:
+            message = None
+        if message is not None:
+            await asyncio.shield(
+                _edit_message_with_retry(
+                    message,
+                    "🛑 System monitoring stopped.",
+                )
+            )
+        raise
     task = context.application.create_task(_run_usage_monitor(message))
     _ACTIVE_MONITORS[key] = task
+    register_task(update, task, "System monitor")
     task.add_done_callback(lambda completed: _forget_monitor(key, completed))

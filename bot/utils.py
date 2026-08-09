@@ -29,6 +29,7 @@ from bot.mtproto import (
     MtprotoDownloader,
     MtprotoError,
 )
+from bot.task_registry import register_task, unregister_task
 
 UPLOAD_DIR = "uploads"
 DB_PATH = "db/authorized_users.db"
@@ -40,12 +41,14 @@ PDF_UPLOAD_POOL_TIMEOUT = 30
 PDF_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 PDF_STATUS_EDIT_INTERVAL = 2.0
 PDF_UPLOAD_STATUS_INTERVAL = 1.0
+PDF_WORKER_JOIN_TIMEOUT = 0.25
 PDF_MEDIA_GROUP_CACHE_LIMIT = 100
 PDF_MEDIA_GROUP_CACHE_TTL_SECONDS = 24 * 60 * 60
 PDF_MEDIA_GROUP_CACHE_KEY = "_pdf_media_groups"
 
 logger = logging.getLogger(__name__)
 _mtproto_downloader = None
+_active_pdf_jobs = {}
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,60 @@ class PdfAlbumSelection:
 
 class PdfDownloadError(Exception):
     """A selected PDF could not be downloaded from Telegram."""
+
+
+def _pdf_job_key(update):
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        message = getattr(update, "message", None)
+        chat_id = getattr(message, "chat_id", None)
+    return chat_id if chat_id is not None else id(update)
+
+
+async def _reserve_pdf_job(update):
+    """Claim one PDF worker per chat without yielding on the success path."""
+    key = _pdf_job_key(update)
+    if key in _active_pdf_jobs:
+        await update.message.reply_text(
+            "⚠️ PDF processing is already running in this chat. "
+            "Please wait for it to finish."
+        )
+        return None
+    task = asyncio.current_task()
+    _active_pdf_jobs[key] = {"task": task, "status": None}
+    register_task(update, task, "PDF processing")
+    return key
+
+
+def _set_pdf_job_status(update, status):
+    job = _active_pdf_jobs.get(_pdf_job_key(update))
+    if job is not None and job.get("task") is asyncio.current_task():
+        job["status"] = status
+
+
+def _release_pdf_job(update, key):
+    job = _active_pdf_jobs.get(key)
+    if job is None or job.get("task") is not asyncio.current_task():
+        return
+    _active_pdf_jobs.pop(key, None)
+    unregister_task(update, job.get("task"))
+
+
+async def _show_pdf_job_stopped(update, key):
+    job = _active_pdf_jobs.get(key)
+    status = job.get("status") if job is not None else None
+    try:
+        if status is not None:
+            await asyncio.shield(
+                status.update("🛑 PDF processing stopped.", force=True)
+            )
+        else:
+            await asyncio.shield(
+                update.message.reply_text("🛑 PDF processing stopped.")
+            )
+    except Exception:
+        logger.warning("Could not report stopped PDF processing", exc_info=True)
 
 
 class _UploadProgressFile:
@@ -826,7 +883,7 @@ async def handle_file_upload(update: Update, context: CallbackContext) -> None:
     )
     document = update.message.document
     caption_args = _splitpdf_caption_args(update.message.caption)
-    pending_split = context.user_data.get("pending_pdf_split")
+    pending_split = context.chat_data.get("pending_pdf_split")
     replied_message = getattr(update.message, "reply_to_message", None)
     is_pending_reply = bool(
         pending_split
@@ -841,63 +898,75 @@ async def handle_file_upload(update: Update, context: CallbackContext) -> None:
     if caption_args is None and not is_pending_reply:
         return
 
-    if not is_user_authorized(update.message.from_user):
-        await update.message.reply_text("❌ You are not authorized to split files.")
+    job_key = await _reserve_pdf_job(update)
+    if job_key is None:
         return
-
-    if not _is_pdf_document(document):
-        await update.message.reply_text("❌ The selected file is not a PDF.")
-        return
-
-    if is_pending_reply:
-        status = _pending_pdf_status(context, pending_split)
-        await status.update(_download_status_text(document), force=True)
-    else:
-        status = await _new_pdf_status(
-            update.message,
-            context,
-            _download_status_text(document),
-        )
 
     try:
-        file_path = await _download_pdf_document(
+        if not is_user_authorized(update.message.from_user):
+            await update.message.reply_text("❌ You are not authorized to split files.")
+            return
+
+        if not _is_pdf_document(document):
+            await update.message.reply_text("❌ The selected file is not a PDF.")
+            return
+
+        if is_pending_reply:
+            status = _pending_pdf_status(context, pending_split)
+            _set_pdf_job_status(update, status)
+            await status.update(_download_status_text(document), force=True)
+        else:
+            status = await _new_pdf_status(
+                update.message,
+                context,
+                _download_status_text(document),
+            )
+            _set_pdf_job_status(update, status)
+
+        try:
+            file_path = await _download_pdf_document(
+                context,
+                document,
+                update.effective_chat.id,
+                update.message.message_id,
+                status=status,
+            )
+        except PdfDownloadError as exc:
+            await status.update(str(exc), force=True)
+            return
+
+        _remember_chat_pdf(
             context,
-            document,
-            update.effective_chat.id,
             update.message.message_id,
-            status=status,
+            file_path,
         )
-    except PdfDownloadError as exc:
-        await status.update(str(exc), force=True)
-        return
 
-    _remember_chat_pdf(
-        context,
-        update.message.message_id,
-        file_path,
-    )
+        if caption_args is not None:
+            context.chat_data.pop("pending_pdf_split", None)
+            await _split_pdf_result(
+                update,
+                context,
+                args=caption_args,
+                input_path=file_path,
+                status=status,
+            )
+            return
 
-    if caption_args is not None:
-        context.user_data.pop("pending_pdf_split", None)
-        await _split_pdf_result(
-            update,
-            context,
-            args=caption_args,
-            input_path=file_path,
-            status=status,
-        )
-        return
-
-    if is_pending_reply:
-        context.user_data.pop("pending_pdf_split", None)
-        await _split_pdf_result(
-            update,
-            context,
-            args=pending_split["args"],
-            input_path=file_path,
-            status=status,
-        )
-        return
+        if is_pending_reply:
+            context.chat_data.pop("pending_pdf_split", None)
+            await _split_pdf_result(
+                update,
+                context,
+                args=pending_split["args"],
+                input_path=file_path,
+                status=status,
+            )
+            return
+    except asyncio.CancelledError:
+        await _show_pdf_job_stopped(update, job_key)
+        raise
+    finally:
+        _release_pdf_job(update, job_key)
 
 
 def _splitpdf_caption_args(caption):
@@ -1242,6 +1311,12 @@ async def _download_pdf_document(
                 await download_with_mtproto()
         if download_path != file_path:
             download_path.replace(file_path)
+    except asyncio.CancelledError:
+        try:
+            download_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     except PdfDownloadError:
         try:
             download_path.unlink(missing_ok=True)
@@ -1333,13 +1408,21 @@ async def _recover_replied_group_pdf(update, context, status=None):
         return None
     finally:
         if forwarded is not None:
+            async def delete_temporary_forward():
+                try:
+                    await context.bot.delete_message(
+                        chat_id=target_chat_id,
+                        message_id=forwarded.message_id,
+                    )
+                except TelegramError:
+                    pass
+
+            cleanup_task = asyncio.create_task(delete_temporary_forward())
             try:
-                await context.bot.delete_message(
-                    chat_id=target_chat_id,
-                    message_id=forwarded.message_id,
-                )
-            except TelegramError:
-                pass
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await asyncio.shield(cleanup_task)
+                raise
 
 
 def _format_elapsed_time(elapsed):
@@ -1485,6 +1568,7 @@ async def _send_pdf_with_retry(
                 finally:
                     finished.set()
                     if ticker is not None:
+                        ticker.cancel()
                         await asyncio.gather(ticker, return_exceptions=True)
 
                 if status is not None:
@@ -1566,6 +1650,42 @@ def _pdf_worker_exception(name, detail):
     return RuntimeError(f"PDF worker failed ({name}): {detail}")
 
 
+def _pdf_worker_is_alive(worker):
+    try:
+        return worker.is_alive()
+    except (AssertionError, ValueError):
+        return False
+
+
+def _signal_pdf_worker(worker, method):
+    try:
+        getattr(worker, method)()
+    except (AssertionError, ProcessLookupError, ValueError):
+        pass
+
+
+def _cleanup_pdf_worker(worker, events, terminate_first=False):
+    """Reap and close multiprocessing objects with bounded waits."""
+    try:
+        if terminate_first and _pdf_worker_is_alive(worker):
+            _signal_pdf_worker(worker, "terminate")
+        if _pdf_worker_is_alive(worker):
+            worker.join(PDF_WORKER_JOIN_TIMEOUT)
+        if _pdf_worker_is_alive(worker):
+            _signal_pdf_worker(worker, "terminate")
+            worker.join(PDF_WORKER_JOIN_TIMEOUT)
+        if _pdf_worker_is_alive(worker) and hasattr(worker, "kill"):
+            _signal_pdf_worker(worker, "kill")
+            worker.join(PDF_WORKER_JOIN_TIMEOUT)
+    finally:
+        try:
+            worker.close()
+        except (AssertionError, ValueError):
+            pass
+        finally:
+            events.close()
+
+
 async def _split_pdf_with_progress(
     input_path,
     duplex,
@@ -1587,8 +1707,16 @@ async def _split_pdf_with_progress(
         ),
         daemon=True,
     )
-    worker.start()
+    try:
+        worker.start()
+    except BaseException:
+        try:
+            worker.close()
+        finally:
+            events.close()
+        raise
 
+    cancelled = False
     try:
         while True:
             event = None
@@ -1641,14 +1769,22 @@ async def _split_pdf_with_progress(
                     f"PDF worker stopped unexpectedly (exit {worker.exitcode})."
                 )
             await asyncio.sleep(0.1)
+    except asyncio.CancelledError:
+        cancelled = True
+        if _pdf_worker_is_alive(worker):
+            _signal_pdf_worker(worker, "terminate")
+        raise
     finally:
-        if worker.is_alive():
-            await asyncio.to_thread(worker.join, 1)
-        if worker.is_alive():
-            worker.terminate()
-            await asyncio.to_thread(worker.join, 1)
-        worker.close()
-        events.close()
+        # Once a result/error event has been consumed, the child has finished
+        # all file writes. Do not wait for its Queue feeder to wind down: that
+        # can block while the parent has stopped draining progress messages.
+        if _pdf_worker_is_alive(worker):
+            _signal_pdf_worker(worker, "terminate")
+        # These joins are deliberately short and synchronous. Offloading this
+        # cleanup to asyncio's executor can leave its completion callback
+        # unable to wake a restricted event loop, hanging both the command and
+        # interpreter shutdown even after the cleanup thread has returned.
+        _cleanup_pdf_worker(worker, events, cancelled)
 
 
 def _pdf_source_name(source):
@@ -1791,6 +1927,9 @@ async def _split_pdf_result(
     announce_completion=True,
 ):
     """Split a selected PDF and return success to internal callers."""
+    if status is not None:
+        _set_pdf_job_status(update, status)
+
     if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to split files.")
         return False
@@ -1828,6 +1967,7 @@ async def _split_pdf_result(
                     "🔎 Locating PDFs in the selected album…",
                     reply_to_message_id=source_reply_id,
                 )
+                _set_pdf_job_status(update, status)
             try:
                 selection = await _resolve_replied_media_group_sources(
                     update,
@@ -1850,6 +1990,7 @@ async def _split_pdf_result(
             context,
             "🔎 Locating the selected PDF…",
         )
+        _set_pdf_job_status(update, status)
 
     try:
         if input_path is None:
@@ -1898,7 +2039,7 @@ async def _split_pdf_result(
             "You can also send the PDF with /splitpdf as its caption."
         )
         await status.update(prompt_text, force=True)
-        context.user_data["pending_pdf_split"] = {
+        context.chat_data["pending_pdf_split"] = {
             "args": pending_args,
             "chat_id": update.effective_chat.id,
             "prompt_message_id": status.message_id,
@@ -1965,4 +2106,13 @@ async def _split_pdf_result(
 
 async def split_pdf(update: Update, context: CallbackContext) -> None:
     """Telegram handler boundary; never expose bool as conversation state."""
-    await _split_pdf_result(update, context)
+    job_key = await _reserve_pdf_job(update)
+    if job_key is None:
+        return
+    try:
+        await _split_pdf_result(update, context)
+    except asyncio.CancelledError:
+        await _show_pdf_job_stopped(update, job_key)
+        raise
+    finally:
+        _release_pdf_job(update, job_key)

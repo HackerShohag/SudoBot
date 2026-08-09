@@ -8,20 +8,42 @@ from unittest.mock import AsyncMock, Mock, patch
 from telegram.error import NetworkError, RetryAfter
 
 from bot import menu
+from bot import task_registry
 
 
-def make_update(status=None):
+def make_update(status=None, *, chat_id=100, user_id=1):
     status = status or SimpleNamespace(edit_text=AsyncMock())
+    user = SimpleNamespace(id=user_id, username="testuser")
     message = SimpleNamespace(
-        from_user=SimpleNamespace(id=1, username="testuser"),
+        from_user=user,
+        chat_id=chat_id,
         reply_text=AsyncMock(return_value=status),
     )
-    return SimpleNamespace(message=message), status
+    return SimpleNamespace(
+        message=message,
+        effective_chat=SimpleNamespace(id=chat_id),
+        effective_user=user,
+    ), status
 
 
 class TestMenu(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         menu._ACTIVE_MONITORS.clear()
+        task_registry._CHAT_TASKS.clear()
+
+    async def asyncTearDown(self):
+        pending = [
+            task
+            for tasks in task_registry._CHAT_TASKS.values()
+            for task in tasks
+            if isinstance(task, asyncio.Future) and not task.done()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        menu._ACTIVE_MONITORS.clear()
+        task_registry._CHAT_TASKS.clear()
 
     def test_cpu_name_falls_back_to_proc_cpuinfo(self):
         uname = SimpleNamespace(
@@ -180,7 +202,8 @@ class TestMenu(unittest.IsolatedAsyncioTestCase):
 
     async def test_monitor_starts_one_background_task(self):
         update, status = make_update()
-        task = SimpleNamespace(done=Mock(return_value=False), add_done_callback=Mock())
+        task = Mock()
+        task.done.return_value = False
         create_task = Mock(return_value=task)
         context = SimpleNamespace(application=SimpleNamespace(create_task=create_task))
 
@@ -193,12 +216,17 @@ class TestMenu(unittest.IsolatedAsyncioTestCase):
         context.application.create_task.assert_called_once()
         monitor_coroutine = context.application.create_task.call_args.args[0]
         self.assertTrue(asyncio.iscoroutine(monitor_coroutine))
-        task.add_done_callback.assert_called_once()
+        self.assertEqual(task.add_done_callback.call_count, 2)
+        self.assertEqual(
+            task_registry.tracked_tasks(update),
+            {task: "System monitor"},
+        )
         monitor_coroutine.close()
 
     async def test_monitor_rejects_a_second_task_for_same_chat_and_user(self):
         update, _ = make_update()
-        task = SimpleNamespace(done=Mock(return_value=False), add_done_callback=Mock())
+        task = Mock()
+        task.done.return_value = False
         create_task = Mock(return_value=task)
         context = SimpleNamespace(application=SimpleNamespace(create_task=create_task))
 
@@ -214,6 +242,148 @@ class TestMenu(unittest.IsolatedAsyncioTestCase):
         )
         monitor_coroutine = create_task.call_args.args[0]
         monitor_coroutine.close()
+
+    async def test_one_shot_status_command_is_cancellable_in_its_chat(self):
+        update, status = make_update()
+        collector_started = asyncio.Event()
+
+        async def blocked_to_thread(_collector):
+            collector_started.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch("bot.menu.is_user_authorized", return_value=True),
+            patch("bot.menu.asyncio.to_thread", side_effect=blocked_to_thread),
+        ):
+            task = asyncio.create_task(menu.get_system_usage(update, None))
+            await asyncio.wait_for(collector_started.wait(), timeout=1)
+            self.assertEqual(
+                task_registry.tracked_tasks(update),
+                {task: "System usage check"},
+            )
+
+            cancelled = task_registry.cancel_chat_tasks(update)
+            await asyncio.gather(task, return_exceptions=True)
+
+        self.assertEqual(cancelled, [(task, "System usage check")])
+        self.assertTrue(task.cancelled())
+        self.assertEqual(task_registry.tracked_tasks(update), {})
+        self.assertEqual(
+            status.edit_text.await_args_list[-1].args[0],
+            "🛑 System usage check stopped.",
+        )
+
+    async def test_monitor_cancellation_updates_same_status_and_cleans_registry(self):
+        update, status = make_update()
+        monitor_started = asyncio.Event()
+
+        async def blocked_monitor(_message):
+            monitor_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await status.edit_text("🛑 System monitoring stopped.")
+                raise
+
+        class Application:
+            @staticmethod
+            def create_task(coroutine):
+                return asyncio.create_task(coroutine)
+
+        context = SimpleNamespace(application=Application())
+        with (
+            patch("bot.menu.is_user_authorized", return_value=True),
+            patch("bot.menu._run_usage_monitor", side_effect=blocked_monitor),
+        ):
+            await menu.monitor_system_usage(update, context)
+            monitor_task = menu._ACTIVE_MONITORS[(100, 1)]
+            await asyncio.wait_for(monitor_started.wait(), timeout=1)
+
+            cancelled = task_registry.cancel_chat_tasks(update)
+            await asyncio.gather(monitor_task, return_exceptions=True)
+            await asyncio.sleep(0)
+
+        self.assertEqual(cancelled, [(monitor_task, "System monitor")])
+        self.assertTrue(monitor_task.cancelled())
+        self.assertEqual(menu._ACTIVE_MONITORS, {})
+        self.assertEqual(task_registry.tracked_tasks(update), {})
+        status.edit_text.assert_awaited_once_with(
+            "🛑 System monitoring stopped."
+        )
+
+    async def test_usage_monitor_cancellation_edits_status_and_reraises(self):
+        status = SimpleNamespace(edit_text=AsyncMock())
+        collection_started = asyncio.Event()
+
+        async def blocked_to_thread(_collector, _interval):
+            collection_started.set()
+            await asyncio.Event().wait()
+
+        with patch(
+            "bot.menu.asyncio.to_thread",
+            side_effect=blocked_to_thread,
+        ):
+            task = asyncio.create_task(menu._run_usage_monitor(status))
+            await asyncio.wait_for(collection_started.wait(), timeout=1)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        self.assertTrue(task.cancelled())
+        status.edit_text.assert_awaited_once_with(
+            "🛑 System monitoring stopped."
+        )
+
+    async def test_monitor_uses_anchored_one_second_update_cadence(self):
+        class Clock:
+            value = 0.0
+
+            def time(self):
+                return self.value
+
+        clock = Clock()
+        edit_times = []
+        rendered = []
+        sleep_delays = []
+        message = SimpleNamespace()
+
+        async def fake_to_thread(_collector, _interval):
+            clock.value += 0.2
+            return "usage"
+
+        async def fake_edit(_message, text):
+            edit_times.append(clock.value)
+            rendered.append(text)
+            return True
+
+        async def fake_sleep(delay):
+            sleep_delays.append(delay)
+            clock.value += delay
+
+        with (
+            patch(
+                "bot.menu.asyncio.get_running_loop",
+                return_value=SimpleNamespace(time=clock.time),
+            ),
+            patch("bot.menu.asyncio.to_thread", side_effect=fake_to_thread),
+            patch("bot.menu.asyncio.sleep", side_effect=fake_sleep),
+            patch("bot.menu._edit_message_with_retry", side_effect=fake_edit),
+            patch("bot.menu.MONITOR_DURATION_SECONDS", 2.1),
+            patch("bot.menu.MONITOR_INTERVAL_SECONDS", 1.0),
+        ):
+            await menu._run_usage_monitor(message)
+
+        monitoring_times = [
+            timestamp
+            for timestamp, text in zip(edit_times, rendered)
+            if text.startswith("🟢 Monitoring")
+        ]
+        self.assertEqual(len(monitoring_times), 3)
+        self.assertAlmostEqual(monitoring_times[0], 0.2)
+        self.assertAlmostEqual(monitoring_times[1], 1.2)
+        self.assertAlmostEqual(monitoring_times[2], 2.2)
+        self.assertAlmostEqual(sleep_delays[0], 0.8)
+        self.assertAlmostEqual(sleep_delays[1], 0.8)
+        self.assertEqual(rendered[-1], "🛑 Stopped monitoring system usage.")
 
 
 if __name__ == "__main__":

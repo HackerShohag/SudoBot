@@ -5,12 +5,19 @@ SudoBot is a powerful **Telegram Bot** that allows users to execute commands, re
 ## 🚀 Features
 - ✅ **Command Execution:** Run shell commands remotely as the configured super admin.
 - ⏱️ **Live Command Status:** Follow elapsed time and streamed output in one edited message.
+- 🛑 **Chat-wide Stop:** `/stop` interrupts all work running in that chat,
+  including shell commands, PDF processing, monitors, and system/IP lookups.
 - 🌍 **IP Information:** Fetch local and public IP addresses.
 - 🖥️ **System Monitoring:** Get system details and disk usage.
 - 📜 **Menu Integration:** Access bot features via a built-in menu.
 - 🔑 **Sudo Support:** Securely run commands as superuser.
 - 🛠️ **Systemd Service Support:** Run the bot as a background system service.
 - 🖨️ **PDF Print Splitting:** Separate uploaded PDFs into B&W and color files.
+
+Long-running work does not block Telegram update handling, so other commands
+and `/stop` remain responsive while jobs are in progress. The five-minute
+system monitor targets one refreshed reading per second; Telegram rate limits
+or network delays can temporarily make an individual update arrive later.
 
 ## 🖨️ Splitting PDFs for Printing
 

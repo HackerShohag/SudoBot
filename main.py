@@ -1,4 +1,5 @@
 import asyncio
+from functools import wraps
 import logging
 
 from telegram.ext import (
@@ -21,6 +22,7 @@ from bot.utils import (
     split_pdf,
 )
 from bot.bot import execute_on_file
+from bot.task_registry import register_task
 
 
 logging.basicConfig(
@@ -28,6 +30,39 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _tracked_handler(callback, label):
+    """Reserve a cancellable task before Telegram dequeues the next update."""
+    @wraps(callback)
+    async def launcher(update, context):
+        coroutine = callback(update, context)
+        try:
+            task = context.application.create_task(
+                coroutine,
+                update=update,
+                name=f"telegram-job:{label.casefold().replace(' ', '-')}",
+            )
+        except Exception:
+            coroutine.close()
+            raise
+        register_task(update, task, label)
+
+    return launcher
+
+
+tracked_file_upload = _tracked_handler(handle_file_upload, "PDF processing")
+tracked_split_pdf = _tracked_handler(split_pdf, "PDF processing")
+tracked_local_ip = _tracked_handler(menu.get_local_ip, "local IP lookup")
+tracked_public_ip = _tracked_handler(menu.get_public_ip, "public IP lookup")
+tracked_system_info = _tracked_handler(menu.get_system_info, "system information")
+tracked_machine_specs = _tracked_handler(menu.get_machine_specs, "machine specifications")
+tracked_system_usage = _tracked_handler(menu.get_system_usage, "system usage")
+tracked_disk_usage = _tracked_handler(menu.get_disk_usage, "disk usage")
+tracked_system_monitor = _tracked_handler(
+    menu.monitor_system_usage,
+    "system monitor startup",
+)
 
 
 async def handle_application_error(update, context):
@@ -46,6 +81,9 @@ async def main():
         .write_timeout(120)
         .media_write_timeout(300)
         .pool_timeout(30)
+        # ConversationHandler requires ordered updates. Long-running work is
+        # detached explicitly below instead of enabling global concurrency.
+        .concurrent_updates(False)
         .build()
     )
 
@@ -60,22 +98,46 @@ async def main():
         ConversationHandler(
             entry_points=[
                 CommandHandler('run', run_command),
-                MessageHandler(filters.Document.ALL, handle_file_upload),
-                CommandHandler("splitpdf", split_pdf),
-                CommandHandler("printer", split_pdf),
-                CommandHandler("runfile", execute_on_file),
                 CommandHandler('stop', stop_command),
-                CommandHandler("get_local_ip", menu.get_local_ip),
-                CommandHandler("get_public_ip", menu.get_public_ip),
-                CommandHandler("get_system_info", menu.get_system_info),
-                CommandHandler("get_machine_specs", menu.get_machine_specs),
-                CommandHandler("get_system_usage", menu.get_system_usage),
-                CommandHandler("get_disk_usage", menu.get_disk_usage),
-                CommandHandler("monitor_system_usage", menu.monitor_system_usage),
             ],
             states={AWAITING_SUDO_PASSWORD: [MessageHandler(
                 filters.TEXT & ~filters.COMMAND, password_input)]},
-            fallbacks=[],
+            # /stop must also cancel an unfinished sudo-password prompt.
+            fallbacks=[CommandHandler('stop', stop_command)],
+        )
+    )
+
+    # These handlers are not conversation states. PDF work may take minutes,
+    # so PTB owns it as a non-blocking task while commands such as /stop and the
+    # system monitors remain responsive.
+    application.add_handler(
+        MessageHandler(filters.Document.ALL, tracked_file_upload)
+    )
+    application.add_handler(CommandHandler("splitpdf", tracked_split_pdf))
+    application.add_handler(CommandHandler("printer", tracked_split_pdf))
+    application.add_handler(CommandHandler("runfile", execute_on_file))
+    application.add_handler(
+        CommandHandler("get_local_ip", tracked_local_ip)
+    )
+    application.add_handler(
+        CommandHandler("get_public_ip", tracked_public_ip)
+    )
+    application.add_handler(
+        CommandHandler("get_system_info", tracked_system_info)
+    )
+    application.add_handler(
+        CommandHandler("get_machine_specs", tracked_machine_specs)
+    )
+    application.add_handler(
+        CommandHandler("get_system_usage", tracked_system_usage)
+    )
+    application.add_handler(
+        CommandHandler("get_disk_usage", tracked_disk_usage)
+    )
+    application.add_handler(
+        CommandHandler(
+            "monitor_system_usage",
+            tracked_system_monitor,
         )
     )
 
