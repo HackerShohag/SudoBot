@@ -879,7 +879,7 @@ async def handle_file_upload(update: Update, context: CallbackContext) -> None:
 
     if caption_args is not None:
         context.user_data.pop("pending_pdf_split", None)
-        await split_pdf(
+        await _split_pdf_result(
             update,
             context,
             args=caption_args,
@@ -890,7 +890,7 @@ async def handle_file_upload(update: Update, context: CallbackContext) -> None:
 
     if is_pending_reply:
         context.user_data.pop("pending_pdf_split", None)
-        await split_pdf(
+        await _split_pdf_result(
             update,
             context,
             args=pending_split["args"],
@@ -1712,7 +1712,7 @@ async def _split_replied_media_group(
 
             if source.chat_id == update.effective_chat.id:
                 _remember_chat_pdf(context, source.message_id, file_path)
-            if await split_pdf(
+            if await _split_pdf_result(
                 update,
                 context,
                 args=split_args,
@@ -1721,7 +1721,6 @@ async def _split_replied_media_group(
                 display_name=file_name,
                 reply_to_message_id=reply_to_message_id,
                 announce_completion=False,
-                return_result=True,
             ):
                 succeeded += 1
         except Exception as exc:
@@ -1781,7 +1780,7 @@ async def _split_replied_media_group(
     return failed == 0
 
 
-async def split_pdf(
+async def _split_pdf_result(
     update: Update,
     context: CallbackContext,
     args=None,
@@ -1790,18 +1789,11 @@ async def split_pdf(
     display_name=None,
     reply_to_message_id=None,
     announce_completion=True,
-    return_result=False,
 ):
-    """Split a selected PDF; optionally return success to internal callers."""
-    def finish(result):
-        # PTB ConversationHandler treats bool as integer conversation states.
-        # Telegram entry points must therefore return None, while the internal
-        # album loop still needs a boolean to count per-file successes.
-        return result if return_result else None
-
+    """Split a selected PDF and return success to internal callers."""
     if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to split files.")
-        return finish(False)
+        return False
 
     split_args = context.args if args is None else args
     try:
@@ -1811,7 +1803,7 @@ async def split_pdf(
             await update.message.reply_text(str(exc))
         else:
             await status.update(str(exc), force=True)
-        return finish(False)
+        return False
 
     message = getattr(update, "effective_message", None) or update.message
     current_chat_id = update.effective_chat.id
@@ -1843,15 +1835,13 @@ async def split_pdf(
                 )
             except PdfDownloadError as exc:
                 await status.update(str(exc), force=True)
-                return finish(False)
-            return finish(
-                await _split_replied_media_group(
-                    update,
-                    context,
-                    selection,
-                    split_args,
-                    status,
-                )
+                return False
+            return await _split_replied_media_group(
+                update,
+                context,
+                selection,
+                split_args,
+                status,
             )
 
     if status is None:
@@ -1876,7 +1866,7 @@ async def split_pdf(
             )
     except PdfDownloadError as exc:
         await status.update(str(exc), force=True)
-        return finish(False)
+        return False
     if input_path is None and explicit_reply:
         input_path = _cached_replied_pdf(
             message,
@@ -1896,7 +1886,7 @@ async def split_pdf(
             )
         except PdfDownloadError as exc:
             await status.update(str(exc), force=True)
-            return finish(False)
+            return False
     if not input_path:
         pending_args = ["--duplex"] if duplex else []
         prompt_text = (
@@ -1913,10 +1903,10 @@ async def split_pdf(
             "chat_id": update.effective_chat.id,
             "prompt_message_id": status.message_id,
         }
-        return finish(False)
+        return False
     if Path(input_path).suffix.lower() != ".pdf":
         await status.update("❌ The selected file is not a PDF.", force=True)
-        return finish(False)
+        return False
 
     await status.update(
         f"⚙️ Splitting PDF in {'duplex' if duplex else 'simplex'} mode…",
@@ -1955,19 +1945,24 @@ async def split_pdf(
                     _split_completion_text(result, duplex),
                     force=True,
                 )
-            return finish(True)
+            return True
     except (FileNotFoundError, ValueError, fitz.FileDataError) as exc:
         await status.update(f"❌ Could not split PDF: {exc}", force=True)
-        return finish(False)
+        return False
     except TelegramError as exc:
         await status.update(
             f"❌ Telegram could not send the result: {exc}",
             force=True,
         )
-        return finish(False)
+        return False
     except Exception as exc:
         await status.update(
             f"❌ Unexpected PDF processing error: {exc}",
             force=True,
         )
-        return finish(False)
+        return False
+
+
+async def split_pdf(update: Update, context: CallbackContext) -> None:
+    """Telegram handler boundary; never expose bool as conversation state."""
+    await _split_pdf_result(update, context)

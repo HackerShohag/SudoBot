@@ -23,6 +23,7 @@ from bot.utils import (
     _find_replied_pdf_document,
     _recover_replied_group_pdf,
     _resolve_replied_media_group_sources,
+    _split_pdf_result,
     _upload_file_path,
     _split_completion_text,
     handle_file_upload,
@@ -640,7 +641,10 @@ class PdfProgressWorkflowTests(unittest.IsolatedAsyncioTestCase):
             patch("bot.utils.TELEGRAM_API_ID", None),
             patch("bot.utils.TELEGRAM_API_HASH", None),
             patch("bot.utils._mtproto_downloader", None),
-            patch("bot.utils.split_pdf", new_callable=AsyncMock) as split,
+            patch(
+                "bot.utils._split_pdf_result",
+                new_callable=AsyncMock,
+            ) as split,
         ):
             await handle_file_upload(self.update(message), context)
 
@@ -1086,10 +1090,9 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as send_pdf,
         ):
-            completed = await split_pdf(
+            completed = await _split_pdf_result(
                 self.update(command),
                 context,
-                return_result=True,
             )
 
         self.assertFalse(completed)
@@ -1190,10 +1193,9 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as sleep,
         ):
-            completed = await split_pdf(
+            completed = await _split_pdf_result(
                 self.update(command),
                 context,
-                return_result=True,
             )
 
         self.assertTrue(completed)
@@ -1254,10 +1256,9 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("bot.utils.logger.warning") as warning,
         ):
-            completed = await split_pdf(
+            completed = await _split_pdf_result(
                 self.update(command),
                 context,
-                return_result=True,
             )
 
         self.assertTrue(completed)
@@ -1310,8 +1311,9 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 return_value=None,
             ),
         ):
-            await split_pdf(self.update(message), context)
+            handler_result = await split_pdf(self.update(message), context)
 
+        self.assertIsNone(handler_result)
         self.assertEqual(
             context.user_data["pending_pdf_split"],
             {
@@ -1358,7 +1360,10 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("bot.utils.is_user_authorized", return_value=True),
-            patch("bot.utils.split_pdf", new_callable=AsyncMock) as split,
+            patch(
+                "bot.utils._split_pdf_result",
+                new_callable=AsyncMock,
+            ) as split,
         ):
             await handle_file_upload(update, context)
 
