@@ -32,9 +32,10 @@ later reply can select the complete album.
 
 For one PDF or a PDF album, the bot keeps one status message updated while it
 downloads, splits, uploads, and finishes. Album progress moves through each PDF
-in order and ends by confirming that all PDFs were processed; each B&W/color
-result still replies to its matching source PDF. Upload statuses show streamed
-bytes, percentage, elapsed time, and retry attempts. Files up to 20 MB use
+in order. After the final result PDF, the bot sends one new combined summary
+below the outputs with the completed and failed counts; each B&W/color result
+still replies to its matching source PDF. Upload statuses show streamed bytes,
+percentage, elapsed time, and retry attempts. Files up to 20 MB use
 Telegram's hosted Bot API. Larger files automatically use a direct MTProto
 download when
 `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are configured; no Docker or local

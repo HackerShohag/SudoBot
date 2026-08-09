@@ -1756,7 +1756,27 @@ async def _split_replied_media_group(
             "\n⚠️ Telegram could not verify album completeness; only cached "
             "PDF files were processed."
         )
-    await batch_status.update(final_text, force=True)
+    try:
+        await update.message.reply_text(
+            final_text,
+            reply_to_message_id=update.message.message_id,
+            allow_sending_without_reply=True,
+        )
+    except TelegramError:
+        logger.warning(
+            "Could not send the final PDF album summary",
+            exc_info=True,
+        )
+        # The original tracker is above the uploaded documents, but retaining
+        # the aggregate result there is still better than losing it entirely.
+        await batch_status.update(final_text, force=True)
+    else:
+        tracker_text = (
+            "⚠️ Finished processing PDFs with failures."
+            if failed
+            else "✅ Finished processing PDFs."
+        )
+        await batch_status.update(tracker_text, force=True)
     return failed == 0
 
 

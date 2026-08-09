@@ -895,7 +895,17 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
         ]
         await self.remember(context, *sources)
         batch_status = self.status_message(700)
-        command = self.command_message(sources[2], [batch_status])
+        final_message = self.status_message(701)
+        timeline = []
+        reply_calls = 0
+
+        async def reply_text(text, **_kwargs):
+            nonlocal reply_calls
+            reply_calls += 1
+            timeline.append(("reply", text))
+            return batch_status if reply_calls == 1 else final_message
+
+        command = self.command_message(sources[2], reply_text)
         update = self.update(command)
         downloader = SimpleNamespace(
             get_media_group_documents=AsyncMock(return_value=[])
@@ -910,6 +920,9 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         async def download(_context, document, chat_id, message_id, **_kwargs):
             return f"uploads/{chat_id}/{message_id}/{document.file_name}"
+
+        async def send_output(_message, _path, _label, **kwargs):
+            timeline.append(("send", kwargs["caption"]))
 
         with (
             patch("bot.utils.is_user_authorized", return_value=True),
@@ -930,6 +943,7 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "bot.utils._send_pdf_with_retry",
                 new_callable=AsyncMock,
+                side_effect=send_output,
             ) as send_pdf,
         ):
             completed = await split_pdf(update, context)
@@ -963,11 +977,25 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 "third.pdf — Color pages",
             ],
         )
-        command.reply_text.assert_awaited_once_with(
+        self.assertEqual(command.reply_text.await_count, 2)
+        first_reply = command.reply_text.await_args_list[0]
+        self.assertEqual(
+            first_reply.args[0],
             "🔎 Locating PDFs in the selected album…",
-            reply_to_message_id=11,
-            allow_sending_without_reply=True,
         )
+        self.assertEqual(first_reply.kwargs["reply_to_message_id"], 11)
+        self.assertTrue(first_reply.kwargs["allow_sending_without_reply"])
+        final_summary = "✅ All PDFs have been processed: 3/3 completed."
+        second_reply = command.reply_text.await_args_list[1]
+        self.assertEqual(second_reply.args[0], final_summary)
+        self.assertEqual(second_reply.kwargs["reply_to_message_id"], 100)
+        self.assertTrue(second_reply.kwargs["allow_sending_without_reply"])
+        self.assertEqual(timeline[-1], ("reply", final_summary))
+        self.assertEqual(
+            [event[0] for event in timeline].count("send"),
+            6,
+        )
+        final_message.edit_text.assert_not_awaited()
         shared_status = download_pdf.await_args_list[0].kwargs["status"]
         self.assertTrue(
             all(
@@ -1010,7 +1038,7 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("PDF split complete" in text for text in edits))
         self.assertEqual(
             edits[-1],
-            "✅ All PDFs have been processed: 3/3 completed.",
+            "✅ Finished processing PDFs.",
         )
 
     async def test_one_album_failure_does_not_stop_later_pdfs(self):
@@ -1018,7 +1046,7 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
         sources = [self.album_message(10), self.album_message(11)]
         await self.remember(context, *sources)
         batch_status = self.status_message(710)
-        command = self.command_message(sources[0], [batch_status])
+        command = self.command_message(sources[0], [batch_status, None])
         downloader = SimpleNamespace(
             get_media_group_documents=AsyncMock(return_value=[])
         )
@@ -1069,7 +1097,16 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
             send_pdf.await_args.kwargs["reply_to_message_id"],
             11,
         )
-        command.reply_text.assert_awaited_once()
+        self.assertEqual(command.reply_text.await_count, 2)
+        final_summary = command.reply_text.await_args_list[1]
+        self.assertEqual(
+            final_summary.args[0],
+            "⚠️ Album processing finished: 1/2 PDFs completed, 1 failed.",
+        )
+        self.assertEqual(final_summary.kwargs["reply_to_message_id"], 100)
+        self.assertTrue(
+            final_summary.kwargs["allow_sending_without_reply"]
+        )
         edits = [
             call.args[0]
             for call in batch_status.edit_text.await_args_list
@@ -1089,7 +1126,7 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             edits[-1],
-            "⚠️ Album processing finished: 1/2 PDFs completed, 1 failed.",
+            "⚠️ Finished processing PDFs with failures.",
         )
 
     async def test_shared_status_edit_timeout_does_not_abort_the_album(self):
@@ -1107,7 +1144,7 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
             message_id=720,
             edit_text=AsyncMock(side_effect=edit_status),
         )
-        command = self.command_message(sources[0], [batch_status])
+        command = self.command_message(sources[0], [batch_status, None])
         downloader = SimpleNamespace(
             get_media_group_documents=AsyncMock(return_value=[])
         )
@@ -1151,10 +1188,72 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(completed)
         self.assertEqual(download_pdf.await_count, 2)
-        command.reply_text.assert_awaited_once()
+        self.assertEqual(command.reply_text.await_count, 2)
         sleep.assert_awaited_once_with(1)
         self.assertEqual(
+            command.reply_text.await_args_list[1].args[0],
+            "✅ All PDFs have been processed: 2/2 completed.",
+        )
+        self.assertEqual(
             status_edits[-1],
+            "✅ Finished processing PDFs.",
+        )
+
+    async def test_final_summary_send_failure_falls_back_to_shared_status(self):
+        context = self.context()
+        sources = [self.album_message(10), self.album_message(11)]
+        await self.remember(context, *sources)
+        batch_status = self.status_message(730)
+        command = self.command_message(
+            sources[0],
+            [batch_status, TimedOut("summary send timed out")],
+        )
+        downloader = SimpleNamespace(
+            get_media_group_documents=AsyncMock(return_value=[])
+        )
+        split_result = SplitResult(
+            bw_path=Path("/tmp/result_BW.pdf"),
+            color_path=None,
+            bw_pages=1,
+            color_pages=0,
+            guide="",
+        )
+
+        async def download(_context, document, chat_id, message_id, **_kwargs):
+            return f"uploads/{chat_id}/{message_id}/{document.file_name}"
+
+        with (
+            patch("bot.utils.is_user_authorized", return_value=True),
+            patch(
+                "bot.utils._get_mtproto_downloader",
+                return_value=downloader,
+            ),
+            patch(
+                "bot.utils._download_pdf_document",
+                new_callable=AsyncMock,
+                side_effect=download,
+            ),
+            patch(
+                "bot.utils._split_pdf_with_progress",
+                new_callable=AsyncMock,
+                return_value=split_result,
+            ),
+            patch(
+                "bot.utils._send_pdf_with_retry",
+                new_callable=AsyncMock,
+            ),
+            patch("bot.utils.logger.warning") as warning,
+        ):
+            completed = await split_pdf(self.update(command), context)
+
+        self.assertTrue(completed)
+        self.assertEqual(command.reply_text.await_count, 2)
+        warning.assert_called_once_with(
+            "Could not send the final PDF album summary",
+            exc_info=True,
+        )
+        self.assertEqual(
+            batch_status.edit_text.await_args.args[0],
             "✅ All PDFs have been processed: 2/2 completed.",
         )
 
