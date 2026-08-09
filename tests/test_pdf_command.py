@@ -948,7 +948,9 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
         ):
             completed = await split_pdf(update, context)
 
-        self.assertTrue(completed)
+        # Telegram handler callbacks must return None so ConversationHandler
+        # does not interpret bool as an unknown conversation state.
+        self.assertIsNone(completed)
         downloader.get_media_group_documents.assert_awaited_once_with(
             self.chat_id,
             11,
@@ -1084,7 +1086,11 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as send_pdf,
         ):
-            completed = await split_pdf(self.update(command), context)
+            completed = await split_pdf(
+                self.update(command),
+                context,
+                return_result=True,
+            )
 
         self.assertFalse(completed)
         self.assertEqual(
@@ -1184,7 +1190,11 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 new_callable=AsyncMock,
             ) as sleep,
         ):
-            completed = await split_pdf(self.update(command), context)
+            completed = await split_pdf(
+                self.update(command),
+                context,
+                return_result=True,
+            )
 
         self.assertTrue(completed)
         self.assertEqual(download_pdf.await_count, 2)
@@ -1244,7 +1254,11 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("bot.utils.logger.warning") as warning,
         ):
-            completed = await split_pdf(self.update(command), context)
+            completed = await split_pdf(
+                self.update(command),
+                context,
+                return_result=True,
+            )
 
         self.assertTrue(completed)
         self.assertEqual(command.reply_text.await_count, 2)
