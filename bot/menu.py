@@ -242,7 +242,7 @@ async def set_bot_menu(application):
     commands = [
         BotCommand("run", "Run a command"),
         BotCommand("stop", "Stop the running command"),
-        BotCommand("splitpdf", "Split a selected PDF into B&W and color"),
+        BotCommand("splitpdf", "Split PDFs or a replied PDF album"),
         BotCommand("authorize", "Authorize a user (admins)"),
         BotCommand("unauthorize", "Revoke user access (admins)"),
         BotCommand("get_local_ip", "Get your local IP address"),

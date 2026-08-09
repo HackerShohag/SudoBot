@@ -40,6 +40,9 @@ PDF_UPLOAD_POOL_TIMEOUT = 30
 PDF_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 PDF_STATUS_EDIT_INTERVAL = 2.0
 PDF_UPLOAD_STATUS_INTERVAL = 1.0
+PDF_MEDIA_GROUP_CACHE_LIMIT = 100
+PDF_MEDIA_GROUP_CACHE_TTL_SECONDS = 24 * 60 * 60
+PDF_MEDIA_GROUP_CACHE_KEY = "_pdf_media_groups"
 
 logger = logging.getLogger(__name__)
 _mtproto_downloader = None
@@ -52,6 +55,20 @@ class SplitResult:
     bw_pages: int
     color_pages: int
     guide: str
+
+
+@dataclass(frozen=True)
+class PdfSource:
+    document: object
+    chat_id: int
+    message_id: int
+    media_group_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PdfAlbumSelection:
+    sources: tuple[PdfSource, ...]
+    verified_complete: bool
 
 
 class PdfDownloadError(Exception):
@@ -104,18 +121,23 @@ class _PdfStatus:
         chat_id=None,
         message_id=None,
         initial_text=None,
+        prefix=None,
     ):
         self._message = message
         self._bot = bot
         self.chat_id = chat_id
         self.message_id = message_id or getattr(message, "message_id", None)
+        self._prefix = prefix
         self._last_text = initial_text
         self._last_edit = time.monotonic() if initial_text else 0.0
         self._lock = asyncio.Lock()
 
     async def update(self, text, *, force=False):
         """Edit the status without allowing edit failures to stop the job."""
-        text = str(text)[:4096]
+        text = str(text)
+        if self._prefix:
+            text = f"{self._prefix}\n{text}"
+        text = text[:4096]
         async with self._lock:
             if text == self._last_text:
                 return True
@@ -168,15 +190,33 @@ class _PdfStatus:
                     return False
         return False
 
+    def set_prefix(self, prefix):
+        self._prefix = prefix
 
-async def _new_pdf_status(message, context, text):
-    sent = await message.reply_text(text[:4096])
+
+async def _new_pdf_status(
+    message,
+    context,
+    text,
+    *,
+    prefix=None,
+    reply_to_message_id=None,
+):
+    rendered_text = f"{prefix}\n{text}" if prefix else text
+    reply_kwargs = {}
+    if reply_to_message_id is not None:
+        reply_kwargs = {
+            "reply_to_message_id": reply_to_message_id,
+            "allow_sending_without_reply": True,
+        }
+    sent = await message.reply_text(rendered_text[:4096], **reply_kwargs)
     return _PdfStatus(
         message=sent,
         bot=getattr(context, "bot", None),
         chat_id=getattr(getattr(message, "chat", None), "id", None),
         message_id=getattr(sent, "message_id", None),
-        initial_text=text[:4096],
+        initial_text=rendered_text[:4096],
+        prefix=prefix,
     )
 
 
@@ -206,6 +246,8 @@ def _download_status_text(document):
 
 
 def _requires_mtproto_download(document):
+    if getattr(document, "mtproto_only", False):
+        return True
     file_size = getattr(document, "file_size", None)
     return (
         isinstance(file_size, (int, float))
@@ -214,7 +256,7 @@ def _requires_mtproto_download(document):
 
 
 def _get_mtproto_downloader():
-    """Return the one download-only MTProto client shared by this process."""
+    """Return the shared direct Telegram client for downloads and albums."""
     global _mtproto_downloader
     if _mtproto_downloader is None:
         _mtproto_downloader = MtprotoDownloader(
@@ -241,18 +283,18 @@ async def close_mtproto_downloader():
         )
 
 
-def _large_download_setup_error(document, detail):
+def _direct_download_setup_error(document, detail):
     size = _human_file_size(getattr(document, "file_size", None))
     size_text = f" ({size})" if size else ""
     return PdfDownloadError(
-        f"❌ Automatic large-file download{size_text} is unavailable: "
+        f"❌ Automatic direct Telegram download{size_text} is unavailable: "
         f"{detail}\n\n"
         "Set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env, install "
         "requirements.txt, and restart the bot."
     )
 
 
-def _large_download_progress_text(document, current, reported_total):
+def _direct_download_progress_text(document, current, reported_total):
     configured_total = getattr(document, "file_size", None)
     total = (
         configured_total
@@ -263,11 +305,11 @@ def _large_download_progress_text(document, current, reported_total):
         current = min(max(current, 0), total)
         percent = round((current / total) * 100)
         return (
-            "⬇️ Downloading large PDF: "
+            "⬇️ Downloading PDF directly: "
             f"{_human_file_size(current)} / {_human_file_size(total)} "
             f"({percent}%)…"
         )
-    return f"⬇️ Downloading large PDF: {_human_file_size(current)}…"
+    return f"⬇️ Downloading PDF directly: {_human_file_size(current)}…"
 
 
 def _split_completion_text(result, duplex):
@@ -711,7 +753,77 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Authorized user not found.")
 
+
+def _media_group_cache(context):
+    storage = getattr(context, "bot_data", None)
+    if not isinstance(storage, dict):
+        storage = context.chat_data
+    return storage.setdefault(PDF_MEDIA_GROUP_CACHE_KEY, {})
+
+
+def _prune_media_group_cache(cache, now):
+    expired = [
+        key
+        for key, value in cache.items()
+        if now - value["updated_at"] > PDF_MEDIA_GROUP_CACHE_TTL_SECONDS
+    ]
+    for key in expired:
+        cache.pop(key, None)
+    while len(cache) > PDF_MEDIA_GROUP_CACHE_LIMIT:
+        oldest = min(
+            cache,
+            key=lambda key: cache[key]["updated_at"],
+        )
+        cache.pop(oldest, None)
+
+
+def _remember_media_group_document(context, message, chat_id):
+    """Cache album metadata only; never download an unselected document."""
+    media_group_id = getattr(message, "media_group_id", None)
+    document = getattr(message, "document", None)
+    message_id = getattr(message, "message_id", None)
+    if (
+        not media_group_id
+        or not isinstance(message_id, int)
+        or not _is_pdf_document(document)
+    ):
+        return
+
+    now = time.monotonic()
+    cache = _media_group_cache(context)
+    _prune_media_group_cache(cache, now)
+    key = (chat_id, str(media_group_id))
+    entry = cache.setdefault(
+        key,
+        {"updated_at": now, "items": {}},
+    )
+    entry["updated_at"] = now
+    entry["items"][message_id] = PdfSource(
+        document=document,
+        chat_id=chat_id,
+        message_id=message_id,
+        media_group_id=str(media_group_id),
+    )
+    _prune_media_group_cache(cache, now)
+
+
+async def observe_pdf_upload(update: Update, context: CallbackContext) -> None:
+    """Passively remember PDF album members without downloading or replying."""
+    message = getattr(update, "effective_message", None) or update.message
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+    if chat_id is not None:
+        _remember_media_group_document(context, message, chat_id)
+
+
 async def handle_file_upload(update: Update, context: CallbackContext) -> None:
+    _remember_media_group_document(
+        context,
+        update.message,
+        update.effective_chat.id,
+    )
     document = update.message.document
     caption_args = _splitpdf_caption_args(update.message.caption)
     pending_split = context.user_data.get("pending_pdf_split")
@@ -813,7 +925,8 @@ def _duplex_from_args(args):
         return False
     raise ValueError(
         "Usage: /splitpdf [--duplex]\n"
-        "Upload a PDF first, reply to a PDF, or use the command as its caption."
+        "Upload a PDF first, reply to a PDF or PDF album, or use the command "
+        "as its caption."
     )
 
 
@@ -858,21 +971,21 @@ def _pdf_from_attachment(attachment):
     )
 
 
-def _find_replied_pdf_document(message):
-    """Find a PDF in normal, quoted, or cross-chat Telegram replies."""
+def _reply_candidates(message):
     if message is None:
-        return None
-
+        return []
     replied = getattr(message, "reply_to_message", None)
     candidates = [replied]
     if replied is not None:
         candidates.append(getattr(replied, "external_reply", None))
         candidates.append(getattr(replied, "reply_to_message", None))
     candidates.append(getattr(message, "external_reply", None))
+    return [candidate for candidate in candidates if candidate is not None]
 
-    for candidate in candidates:
-        if candidate is None:
-            continue
+
+def _find_replied_pdf_document(message):
+    """Find a PDF in normal, quoted, or cross-chat Telegram replies."""
+    for candidate in _reply_candidates(message):
         document = getattr(candidate, "document", None)
         if _is_pdf_document(document):
             return document
@@ -886,19 +999,7 @@ def _find_replied_pdf_document(message):
 
 def _reply_message_reference(message, current_chat_id):
     """Return the source (chat_id, message_id) for a Telegram reply."""
-    if message is None:
-        return None
-
-    replied = getattr(message, "reply_to_message", None)
-    candidates = [replied]
-    if replied is not None:
-        candidates.append(getattr(replied, "external_reply", None))
-        candidates.append(getattr(replied, "reply_to_message", None))
-    candidates.append(getattr(message, "external_reply", None))
-
-    for candidate in candidates:
-        if candidate is None:
-            continue
+    for candidate in _reply_candidates(message):
         message_id = getattr(candidate, "message_id", None)
         if message_id is None:
             continue
@@ -906,6 +1007,112 @@ def _reply_message_reference(message, current_chat_id):
         chat_id = getattr(chat, "id", None) or current_chat_id
         return chat_id, message_id
     return None
+
+
+def _replied_media_group_reference(message, current_chat_id):
+    """Return (chat, message, group) when a reply targets an album member."""
+    for candidate in _reply_candidates(message):
+        media_group_id = getattr(candidate, "media_group_id", None)
+        message_id = getattr(candidate, "message_id", None)
+        if not media_group_id or not isinstance(message_id, int):
+            continue
+        chat = getattr(candidate, "chat", None)
+        chat_id = getattr(chat, "id", None) or current_chat_id
+        return chat_id, message_id, str(media_group_id)
+    return None
+
+
+def _cached_media_group_sources(context, chat_id, media_group_id):
+    now = time.monotonic()
+    cache = _media_group_cache(context)
+    _prune_media_group_cache(cache, now)
+    entry = cache.get((chat_id, str(media_group_id)))
+    if entry is None:
+        return []
+    return [
+        entry["items"][message_id]
+        for message_id in sorted(entry["items"])
+    ]
+
+
+async def _resolve_replied_media_group_sources(update, context):
+    """Resolve the PDFs in the exact album selected by the reply."""
+    message = getattr(update, "effective_message", None) or update.message
+    reference = _replied_media_group_reference(
+        message,
+        update.effective_chat.id,
+    )
+    if reference is None:
+        return None
+    source_chat_id, source_message_id, media_group_id = reference
+    cached = _cached_media_group_sources(
+        context,
+        source_chat_id,
+        media_group_id,
+    )
+    sources = {source.message_id: source for source in cached}
+    lookup_succeeded = False
+
+    try:
+        downloader = _get_mtproto_downloader()
+        recovered = await downloader.get_media_group_documents(
+            source_chat_id,
+            source_message_id,
+        )
+        lookup_succeeded = True
+    except (MtprotoConfigurationError, MtprotoDependencyError) as exc:
+        if len(sources) <= 1:
+            raise PdfDownloadError(
+                "❌ I detected a Telegram album but could not retrieve all "
+                "of its files. Disable Privacy Mode for this bot in "
+                "BotFather, or set working TELEGRAM_API_ID and "
+                "TELEGRAM_API_HASH values, restart, and try again."
+            ) from exc
+    except MtprotoError as exc:
+        logger.warning(
+            "MTProto album lookup failed for chat %s message %s",
+            source_chat_id,
+            source_message_id,
+            exc_info=True,
+        )
+        if len(sources) <= 1:
+            raise PdfDownloadError(
+                "❌ Telegram identified an album, but the bot could not "
+                "access all of its files. Make sure the bot is still a "
+                "member of this group and try again."
+            ) from exc
+    else:
+        for document in recovered:
+            document_message_id = getattr(document, "message_id", None)
+            document_media_group_id = getattr(
+                document,
+                "media_group_id",
+                None,
+            )
+            if (
+                not isinstance(document_message_id, int)
+                or str(document_media_group_id) != media_group_id
+                or not _is_pdf_document(document)
+            ):
+                continue
+            sources.setdefault(
+                document_message_id,
+                PdfSource(
+                    document=document,
+                    chat_id=source_chat_id,
+                    message_id=document_message_id,
+                    media_group_id=media_group_id,
+                ),
+            )
+
+    if not sources:
+        raise PdfDownloadError(
+            "❌ The selected Telegram album does not contain any PDF files."
+        )
+    return PdfAlbumSelection(
+        sources=tuple(sources[message_id] for message_id in sorted(sources)),
+        verified_complete=lookup_succeeded,
+    )
 
 
 def _has_explicit_reply(message):
@@ -975,22 +1182,22 @@ async def _download_pdf_document(
         try:
             downloader = _get_mtproto_downloader()
         except MtprotoConfigurationError as exc:
-            raise _large_download_setup_error(document, str(exc)) from exc
+            raise _direct_download_setup_error(document, str(exc)) from exc
         except MtprotoDependencyError as exc:
-            raise _large_download_setup_error(document, str(exc)) from exc
+            raise _direct_download_setup_error(document, str(exc)) from exc
 
         if status is not None:
             size = _human_file_size(getattr(document, "file_size", None))
             size_text = f" ({size})" if size else ""
             await status.update(
-                f"⬇️ Preparing large-file download{size_text}…",
+                f"⬇️ Preparing direct Telegram download{size_text}…",
                 force=True,
             )
 
         async def report_progress(current, total):
             if status is not None:
                 await status.update(
-                    _large_download_progress_text(
+                    _direct_download_progress_text(
                         document,
                         current,
                         total,
@@ -1004,7 +1211,7 @@ async def _download_pdf_document(
                 report_progress if status is not None else None,
             )
         except (MtprotoConfigurationError, MtprotoDependencyError) as exc:
-            raise _large_download_setup_error(document, str(exc)) from exc
+            raise _direct_download_setup_error(document, str(exc)) from exc
         except MtprotoError as exc:
             logger.warning(
                 "MTProto download failed for Telegram file %s",
@@ -1013,7 +1220,7 @@ async def _download_pdf_document(
             )
             raise PdfDownloadError(
                 "❌ Could not download the selected PDF through Telegram's "
-                "large-file connection. Check TELEGRAM_API_ID and "
+                "direct connection. Check TELEGRAM_API_ID and "
                 "TELEGRAM_API_HASH, or reply to a freshly uploaded copy, then "
                 "run /splitpdf again."
             ) from exc
@@ -1211,7 +1418,15 @@ async def _upload_progress_ticker(
             )
 
 
-async def _send_pdf_with_retry(message, output_path, label, *, status=None):
+async def _send_pdf_with_retry(
+    message,
+    output_path,
+    label,
+    *,
+    status=None,
+    reply_to_message_id=None,
+    caption=None,
+):
     """Stream a PDF with byte progress and transient-network retries."""
     output_path = Path(output_path)
     total_bytes = output_path.stat().st_size
@@ -1252,13 +1467,20 @@ async def _send_pdf_with_retry(message, output_path, label, *, status=None):
                         )
                     )
                 try:
+                    reply_kwargs = {}
+                    if reply_to_message_id is not None:
+                        reply_kwargs = {
+                            "reply_to_message_id": reply_to_message_id,
+                            "allow_sending_without_reply": True,
+                        }
                     await message.reply_document(
                         document=document,
-                        caption=label,
+                        caption=caption or label,
                         read_timeout=PDF_UPLOAD_READ_TIMEOUT,
                         write_timeout=PDF_UPLOAD_WRITE_TIMEOUT,
                         connect_timeout=PDF_UPLOAD_CONNECT_TIMEOUT,
                         pool_timeout=PDF_UPLOAD_POOL_TIMEOUT,
+                        **reply_kwargs,
                     )
                 finally:
                     finished.set()
@@ -1429,30 +1651,179 @@ async def _split_pdf_with_progress(
         events.close()
 
 
+def _pdf_source_name(source):
+    return Path(
+        getattr(source.document, "file_name", None)
+        or f"document-{source.message_id}.pdf"
+    ).name
+
+
+async def _split_replied_media_group(
+    update,
+    context,
+    selection,
+    split_args,
+    batch_status,
+):
+    """Download, split, and upload selected album PDFs strictly in order."""
+    sources = selection.sources
+    total = len(sources)
+    succeeded = 0
+    discovery_text = (
+        f"📚 Found {total} {'PDF' if total == 1 else 'PDFs'} in the "
+        "selected album. "
+        "Processing them one by one…"
+    )
+    if not selection.verified_complete:
+        discovery_text += (
+            "\n⚠️ Direct album verification was unavailable, so these are "
+            "the PDF files observed by the bot."
+        )
+    await batch_status.update(
+        discovery_text,
+        force=True,
+    )
+
+    for index, source in enumerate(sources, start=1):
+        file_name = _pdf_source_name(source)
+        prefix = f"📄 PDFs: {index}/{total} — {file_name}"
+        reply_to_message_id = (
+            source.message_id
+            if source.chat_id == update.effective_chat.id
+            else None
+        )
+        batch_status.set_prefix(prefix)
+        try:
+            await batch_status.update(
+                _download_status_text(source.document),
+                force=True,
+            )
+            try:
+                file_path = await _download_pdf_document(
+                    context,
+                    source.document,
+                    source.chat_id,
+                    source.message_id,
+                    status=batch_status,
+                )
+            except PdfDownloadError as exc:
+                await batch_status.update(str(exc), force=True)
+                continue
+
+            if source.chat_id == update.effective_chat.id:
+                _remember_chat_pdf(context, source.message_id, file_path)
+            if await split_pdf(
+                update,
+                context,
+                args=split_args,
+                input_path=file_path,
+                status=batch_status,
+                display_name=file_name,
+                reply_to_message_id=reply_to_message_id,
+                announce_completion=False,
+            ):
+                succeeded += 1
+        except Exception as exc:
+            logger.exception(
+                "Unexpected failure while processing album PDF message %s",
+                source.message_id,
+            )
+            await batch_status.update(
+                f"❌ Unexpected PDF processing error: {exc}",
+                force=True,
+            )
+        finally:
+            batch_status.set_prefix(None)
+
+    failed = total - succeeded
+    noun = "PDF" if total == 1 else "PDFs"
+    if failed:
+        final_text = (
+            f"⚠️ Album processing finished: {succeeded}/{total} {noun} "
+            f"completed, {failed} failed."
+        )
+    elif selection.verified_complete:
+        final_text = (
+            f"✅ All PDFs have been processed: {succeeded}/{total} completed."
+        )
+    else:
+        final_text = (
+            f"✅ Cached PDFs have been processed: {succeeded}/{total} "
+            "completed."
+        )
+    if not selection.verified_complete:
+        final_text += (
+            "\n⚠️ Telegram could not verify album completeness; only cached "
+            "PDF files were processed."
+        )
+    await batch_status.update(final_text, force=True)
+    return failed == 0
+
+
 async def split_pdf(
     update: Update,
     context: CallbackContext,
     args=None,
     input_path=None,
     status=None,
+    display_name=None,
+    reply_to_message_id=None,
+    announce_completion=True,
 ):
-    """Split the latest/replied PDF and send all generated files to Telegram."""
+    """Split an explicitly selected PDF or the PDFs in its replied album."""
     if not is_user_authorized(update.message.from_user):
         await update.message.reply_text("❌ You are not authorized to split files.")
-        return
+        return False
 
+    split_args = context.args if args is None else args
     try:
-        duplex = _duplex_from_args(context.args if args is None else args)
+        duplex = _duplex_from_args(split_args)
     except ValueError as exc:
         if status is None:
             await update.message.reply_text(str(exc))
         else:
             await status.update(str(exc), force=True)
-        return
+        return False
 
     message = getattr(update, "effective_message", None) or update.message
     current_chat_id = update.effective_chat.id
     explicit_reply = _has_explicit_reply(message)
+
+    if input_path is None:
+        album_reference = _replied_media_group_reference(
+            message,
+            current_chat_id,
+        )
+        if album_reference is not None:
+            if status is None:
+                source_chat_id, source_message_id, _ = album_reference
+                source_reply_id = (
+                    source_message_id
+                    if source_chat_id == current_chat_id
+                    else None
+                )
+                status = await _new_pdf_status(
+                    update.message,
+                    context,
+                    "🔎 Locating PDFs in the selected album…",
+                    reply_to_message_id=source_reply_id,
+                )
+            try:
+                selection = await _resolve_replied_media_group_sources(
+                    update,
+                    context,
+                )
+            except PdfDownloadError as exc:
+                await status.update(str(exc), force=True)
+                return False
+            return await _split_replied_media_group(
+                update,
+                context,
+                selection,
+                split_args,
+                status,
+            )
+
     if status is None:
         status = await _new_pdf_status(
             update.message,
@@ -1475,7 +1846,7 @@ async def split_pdf(
             )
     except PdfDownloadError as exc:
         await status.update(str(exc), force=True)
-        return
+        return False
     if input_path is None and explicit_reply:
         input_path = _cached_replied_pdf(
             message,
@@ -1495,7 +1866,7 @@ async def split_pdf(
             )
         except PdfDownloadError as exc:
             await status.update(str(exc), force=True)
-            return
+            return False
     if not input_path:
         pending_args = ["--duplex"] if duplex else []
         prompt_text = (
@@ -1512,10 +1883,10 @@ async def split_pdf(
             "chat_id": update.effective_chat.id,
             "prompt_message_id": status.message_id,
         }
-        return
+        return False
     if Path(input_path).suffix.lower() != ".pdf":
         await status.update("❌ The selected file is not a PDF.", force=True)
-        return
+        return False
 
     await status.update(
         f"⚙️ Splitting PDF in {'duplex' if duplex else 'simplex'} mode…",
@@ -1536,25 +1907,37 @@ async def split_pdf(
                 ("Color pages", result.color_path),
             ):
                 if output_path:
+                    output_caption = (
+                        f"{display_name} — {label}"
+                        if display_name
+                        else label
+                    )
                     await _send_pdf_with_retry(
                         update.message,
                         output_path,
                         label,
                         status=status,
+                        reply_to_message_id=reply_to_message_id,
+                        caption=output_caption,
                     )
-            await status.update(
-                _split_completion_text(result, duplex),
-                force=True,
-            )
+            if announce_completion:
+                await status.update(
+                    _split_completion_text(result, duplex),
+                    force=True,
+                )
+            return True
     except (FileNotFoundError, ValueError, fitz.FileDataError) as exc:
         await status.update(f"❌ Could not split PDF: {exc}", force=True)
+        return False
     except TelegramError as exc:
         await status.update(
             f"❌ Telegram could not send the result: {exc}",
             force=True,
         )
+        return False
     except Exception as exc:
         await status.update(
             f"❌ Unexpected PDF processing error: {exc}",
             force=True,
         )
+        return False

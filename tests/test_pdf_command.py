@@ -2,13 +2,14 @@ import asyncio
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import ANY, AsyncMock, patch
 from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, patch
 
 import fitz
 from telegram import InputFile
 from telegram.error import BadRequest, TimedOut
 
+from bot.mtproto import MtprotoConfigurationError, MtprotoDocument
 from bot.utils import (
     PDF_DOWNLOAD_LIMIT_BYTES,
     PDF_UPLOAD_ATTEMPTS,
@@ -21,12 +22,14 @@ from bot.utils import (
     _cached_replied_pdf,
     _find_replied_pdf_document,
     _recover_replied_group_pdf,
+    _resolve_replied_media_group_sources,
     _upload_file_path,
     _split_completion_text,
     handle_file_upload,
     _send_pdf_with_retry,
     _split_pdf_with_progress,
     _splitpdf_caption_args,
+    observe_pdf_upload,
     split_pdf,
 )
 
@@ -171,6 +174,9 @@ class PdfUploadRetryTests(unittest.IsolatedAsyncioTestCase):
             async def upload_document(**kwargs):
                 document = kwargs["document"]
                 self.assertIsInstance(document, InputFile)
+                self.assertEqual(kwargs["reply_to_message_id"], 42)
+                self.assertTrue(kwargs["allow_sending_without_reply"])
+                self.assertEqual(kwargs["caption"], "main.pdf — B&W pages")
                 streamed_documents.append(document)
                 tracked_file = document.input_file_content
                 self.assertNotIsInstance(tracked_file, bytes)
@@ -192,6 +198,8 @@ class PdfUploadRetryTests(unittest.IsolatedAsyncioTestCase):
                     output_path,
                     "B&W pages",
                     status=status,
+                    reply_to_message_id=42,
+                    caption="main.pdf — B&W pages",
                 )
 
             self.assertEqual(len(streamed_documents), 1)
@@ -371,6 +379,45 @@ class PdfDownloadTests(unittest.IsolatedAsyncioTestCase):
             telegram_file.download_to_drive.assert_awaited_once_with(result)
             mtproto.assert_not_called()
 
+    async def test_recovered_album_document_keeps_the_mtproto_transport(self):
+        with TemporaryDirectory() as tmp:
+            context = SimpleNamespace(
+                bot=SimpleNamespace(get_file=AsyncMock())
+            )
+            document = MtprotoDocument(
+                message_id=42,
+                media_group_id="album-one",
+                file_id="direct-file",
+                file_unique_id="direct-unique",
+                file_name="small.pdf",
+                mime_type="application/pdf",
+                file_size=1_024,
+            )
+            downloader = SimpleNamespace(download=AsyncMock())
+
+            async def download(_file_id, destination, _progress):
+                Path(destination).write_bytes(b"%PDF direct")
+                return Path(destination)
+
+            downloader.download.side_effect = download
+            with (
+                patch("bot.utils.UPLOAD_DIR", tmp),
+                patch(
+                    "bot.utils._get_mtproto_downloader",
+                    return_value=downloader,
+                ),
+            ):
+                result = await _download_pdf_document(
+                    context,
+                    document,
+                    500,
+                    42,
+                )
+
+            self.assertEqual(Path(result).read_bytes(), b"%PDF direct")
+            context.bot.get_file.assert_not_awaited()
+            downloader.download.assert_awaited_once()
+
     async def test_unknown_size_cloud_rejection_retries_with_mtproto(self):
         with TemporaryDirectory() as tmp:
             async def fail_after_partial(path):
@@ -518,7 +565,7 @@ class PdfProgressWorkflowTests(unittest.IsolatedAsyncioTestCase):
             guide="Manual printing guide\n" + ("detail\n" * 1000),
         )
 
-        async def fake_upload(_message, _path, label, *, status):
+        async def fake_upload(_message, _path, label, *, status, **_kwargs):
             await status.update(
                 f"⬆️ Uploading {label}: 50%…",
                 force=True,
@@ -633,6 +680,483 @@ class PdfProgressWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(result.bw_pages, 1)
             self.assertTrue(result.bw_path.is_file())
+
+
+class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    chat_id = -500
+
+    @staticmethod
+    def document(message_id, *, name=None, mime_type="application/pdf"):
+        return SimpleNamespace(
+            file_id=f"file-{message_id}",
+            file_unique_id=f"unique-{message_id}",
+            file_name=name or f"source-{message_id}.pdf",
+            mime_type=mime_type,
+            file_size=1_024,
+        )
+
+    @classmethod
+    def album_message(
+        cls,
+        message_id,
+        *,
+        media_group_id="album-one",
+        name=None,
+        mime_type="application/pdf",
+    ):
+        return SimpleNamespace(
+            from_user=SimpleNamespace(id=100, username="user"),
+            message_id=message_id,
+            media_group_id=media_group_id,
+            document=cls.document(
+                message_id,
+                name=name,
+                mime_type=mime_type,
+            ),
+            caption=None,
+            reply_to_message=None,
+            external_reply=None,
+            chat=SimpleNamespace(id=cls.chat_id),
+            reply_text=AsyncMock(),
+        )
+
+    @classmethod
+    def update(cls, message):
+        return SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=cls.chat_id),
+        )
+
+    @staticmethod
+    def status_message(message_id):
+        return SimpleNamespace(
+            message_id=message_id,
+            edit_text=AsyncMock(),
+        )
+
+    @classmethod
+    def command_message(cls, replied, status_messages):
+        return SimpleNamespace(
+            from_user=SimpleNamespace(id=100, username="user"),
+            message_id=100,
+            document=None,
+            caption=None,
+            media_group_id=None,
+            reply_to_message=replied,
+            external_reply=None,
+            chat=SimpleNamespace(id=cls.chat_id),
+            reply_text=AsyncMock(side_effect=status_messages),
+            reply_document=AsyncMock(),
+        )
+
+    @staticmethod
+    def context():
+        return SimpleNamespace(
+            args=[],
+            bot=SimpleNamespace(get_file=AsyncMock()),
+            bot_data={},
+            chat_data={},
+            user_data={},
+        )
+
+    async def remember(self, context, *messages):
+        for message in messages:
+            await observe_pdf_upload(self.update(message), context)
+
+    async def test_observer_caches_only_album_metadata_without_downloading(self):
+        context = self.context()
+        selected = [
+            self.album_message(12),
+            self.album_message(10),
+            self.album_message(11),
+        ]
+        unrelated = self.album_message(20, media_group_id="album-two")
+        non_pdf = self.album_message(
+            13,
+            name="notes.txt",
+            mime_type="text/plain",
+        )
+
+        with patch("bot.utils.is_user_authorized") as authorized:
+            await self.remember(
+                context,
+                *selected,
+                unrelated,
+                non_pdf,
+            )
+
+        cache = context.bot_data["_pdf_media_groups"]
+        self.assertEqual(
+            sorted(cache[(self.chat_id, "album-one")]["items"]),
+            [10, 11, 12],
+        )
+        self.assertEqual(
+            sorted(cache[(self.chat_id, "album-two")]["items"]),
+            [20],
+        )
+        context.bot.get_file.assert_not_awaited()
+        authorized.assert_not_called()
+        for message in (*selected, unrelated, non_pdf):
+            message.reply_text.assert_not_awaited()
+
+    async def test_album_metadata_cache_is_strictly_bounded(self):
+        context = self.context()
+
+        with patch("bot.utils.PDF_MEDIA_GROUP_CACHE_LIMIT", 2):
+            await self.remember(
+                context,
+                self.album_message(10, media_group_id="album-one"),
+                self.album_message(20, media_group_id="album-two"),
+                self.album_message(30, media_group_id="album-three"),
+            )
+
+        cache = context.bot_data["_pdf_media_groups"]
+        self.assertEqual(len(cache), 2)
+        self.assertNotIn((self.chat_id, "album-one"), cache)
+
+    async def test_cache_miss_recovers_exact_album_through_mtproto(self):
+        replied = self.album_message(22)
+        command = self.command_message(replied, [])
+        context = self.context()
+        recovered = [
+            MtprotoDocument(
+                message_id=23,
+                media_group_id="album-one",
+                file_id="file-23",
+                file_unique_id="unique-23",
+                file_name="third.pdf",
+                mime_type="application/pdf",
+                file_size=300,
+            ),
+            MtprotoDocument(
+                message_id=22,
+                media_group_id="album-one",
+                file_id="file-22",
+                file_unique_id="unique-22",
+                file_name="second.pdf",
+                mime_type="application/pdf",
+                file_size=200,
+            ),
+        ]
+        downloader = SimpleNamespace(
+            get_media_group_documents=AsyncMock(return_value=recovered)
+        )
+
+        with patch(
+            "bot.utils._get_mtproto_downloader",
+            return_value=downloader,
+        ):
+            selection = await _resolve_replied_media_group_sources(
+                self.update(command),
+                context,
+            )
+
+        downloader.get_media_group_documents.assert_awaited_once_with(
+            self.chat_id,
+            22,
+        )
+        self.assertTrue(selection.verified_complete)
+        self.assertEqual(
+            [source.message_id for source in selection.sources],
+            [22, 23],
+        )
+        self.assertTrue(
+            all(source.document.mtproto_only for source in selection.sources)
+        )
+
+    async def test_cached_album_is_marked_unverified_when_direct_lookup_is_offline(self):
+        context = self.context()
+        sources = [self.album_message(10), self.album_message(11)]
+        await self.remember(context, *sources)
+        command = self.command_message(sources[0], [])
+
+        with patch(
+            "bot.utils._get_mtproto_downloader",
+            side_effect=MtprotoConfigurationError("credentials unavailable"),
+        ):
+            selection = await _resolve_replied_media_group_sources(
+                self.update(command),
+                context,
+            )
+
+        self.assertFalse(selection.verified_complete)
+        self.assertEqual(
+            [source.message_id for source in selection.sources],
+            [10, 11],
+        )
+
+    async def test_replied_album_processes_pdfs_in_order_with_one_status(self):
+        context = self.context()
+        sources = [
+            self.album_message(12, name="third.pdf"),
+            self.album_message(10, name="first.pdf"),
+            self.album_message(11, name="second.pdf"),
+        ]
+        await self.remember(context, *sources)
+        batch_status = self.status_message(700)
+        command = self.command_message(sources[2], [batch_status])
+        update = self.update(command)
+        downloader = SimpleNamespace(
+            get_media_group_documents=AsyncMock(return_value=[])
+        )
+        split_result = SplitResult(
+            bw_path=Path("/tmp/result_BW.pdf"),
+            color_path=Path("/tmp/result_Color.pdf"),
+            bw_pages=2,
+            color_pages=1,
+            guide="",
+        )
+
+        async def download(_context, document, chat_id, message_id, **_kwargs):
+            return f"uploads/{chat_id}/{message_id}/{document.file_name}"
+
+        with (
+            patch("bot.utils.is_user_authorized", return_value=True),
+            patch(
+                "bot.utils._get_mtproto_downloader",
+                return_value=downloader,
+            ),
+            patch(
+                "bot.utils._download_pdf_document",
+                new_callable=AsyncMock,
+                side_effect=download,
+            ) as download_pdf,
+            patch(
+                "bot.utils._split_pdf_with_progress",
+                new_callable=AsyncMock,
+                return_value=split_result,
+            ) as split_progress,
+            patch(
+                "bot.utils._send_pdf_with_retry",
+                new_callable=AsyncMock,
+            ) as send_pdf,
+        ):
+            completed = await split_pdf(update, context)
+
+        self.assertTrue(completed)
+        downloader.get_media_group_documents.assert_awaited_once_with(
+            self.chat_id,
+            11,
+        )
+        self.assertEqual(
+            [call.args[3] for call in download_pdf.await_args_list],
+            [10, 11, 12],
+        )
+        self.assertEqual(split_progress.await_count, 3)
+        self.assertEqual(send_pdf.await_count, 6)
+        self.assertEqual(
+            [
+                call.kwargs["reply_to_message_id"]
+                for call in send_pdf.await_args_list
+            ],
+            [10, 10, 11, 11, 12, 12],
+        )
+        self.assertEqual(
+            [call.kwargs["caption"] for call in send_pdf.await_args_list],
+            [
+                "first.pdf — B&W pages",
+                "first.pdf — Color pages",
+                "second.pdf — B&W pages",
+                "second.pdf — Color pages",
+                "third.pdf — B&W pages",
+                "third.pdf — Color pages",
+            ],
+        )
+        command.reply_text.assert_awaited_once_with(
+            "🔎 Locating PDFs in the selected album…",
+            reply_to_message_id=11,
+            allow_sending_without_reply=True,
+        )
+        shared_status = download_pdf.await_args_list[0].kwargs["status"]
+        self.assertTrue(
+            all(
+                call.kwargs["status"] is shared_status
+                for call in download_pdf.await_args_list
+            )
+        )
+        self.assertTrue(
+            all(
+                call.args[3] is shared_status
+                for call in split_progress.await_args_list
+            )
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["status"] is shared_status
+                for call in send_pdf.await_args_list
+            )
+        )
+
+        edits = [
+            call.args[0]
+            for call in batch_status.edit_text.await_args_list
+        ]
+        prefixes = [
+            "📄 PDFs: 1/3 — first.pdf",
+            "📄 PDFs: 2/3 — second.pdf",
+            "📄 PDFs: 3/3 — third.pdf",
+        ]
+        prefix_positions = [
+            next(
+                index
+                for index, text in enumerate(edits)
+                if text.startswith(prefix)
+            )
+            for prefix in prefixes
+        ]
+        self.assertEqual(prefix_positions, sorted(prefix_positions))
+        self.assertFalse(any("every PDF" in text for text in edits))
+        self.assertFalse(any("PDF split complete" in text for text in edits))
+        self.assertEqual(
+            edits[-1],
+            "✅ All PDFs have been processed: 3/3 completed.",
+        )
+
+    async def test_one_album_failure_does_not_stop_later_pdfs(self):
+        context = self.context()
+        sources = [self.album_message(10), self.album_message(11)]
+        await self.remember(context, *sources)
+        batch_status = self.status_message(710)
+        command = self.command_message(sources[0], [batch_status])
+        downloader = SimpleNamespace(
+            get_media_group_documents=AsyncMock(return_value=[])
+        )
+        split_result = SplitResult(
+            bw_path=Path("/tmp/result_BW.pdf"),
+            color_path=None,
+            bw_pages=1,
+            color_pages=0,
+            guide="",
+        )
+
+        async def download(_context, document, chat_id, message_id, **_kwargs):
+            if message_id == 10:
+                raise PdfDownloadError("❌ first download failed")
+            return f"uploads/{chat_id}/{message_id}/{document.file_name}"
+
+        with (
+            patch("bot.utils.is_user_authorized", return_value=True),
+            patch(
+                "bot.utils._get_mtproto_downloader",
+                return_value=downloader,
+            ),
+            patch(
+                "bot.utils._download_pdf_document",
+                new_callable=AsyncMock,
+                side_effect=download,
+            ) as download_pdf,
+            patch(
+                "bot.utils._split_pdf_with_progress",
+                new_callable=AsyncMock,
+                return_value=split_result,
+            ) as split_progress,
+            patch(
+                "bot.utils._send_pdf_with_retry",
+                new_callable=AsyncMock,
+            ) as send_pdf,
+        ):
+            completed = await split_pdf(self.update(command), context)
+
+        self.assertFalse(completed)
+        self.assertEqual(
+            [call.args[3] for call in download_pdf.await_args_list],
+            [10, 11],
+        )
+        split_progress.assert_awaited_once()
+        send_pdf.assert_awaited_once()
+        self.assertEqual(
+            send_pdf.await_args.kwargs["reply_to_message_id"],
+            11,
+        )
+        command.reply_text.assert_awaited_once()
+        edits = [
+            call.args[0]
+            for call in batch_status.edit_text.await_args_list
+        ]
+        self.assertTrue(
+            any(
+                text.startswith("📄 PDFs: 1/2 — source-10.pdf")
+                and "first download failed" in text
+                for text in edits
+            )
+        )
+        self.assertTrue(
+            any(
+                text.startswith("📄 PDFs: 2/2 — source-11.pdf")
+                for text in edits
+            )
+        )
+        self.assertEqual(
+            edits[-1],
+            "⚠️ Album processing finished: 1/2 PDFs completed, 1 failed.",
+        )
+
+    async def test_shared_status_edit_timeout_does_not_abort_the_album(self):
+        context = self.context()
+        sources = [self.album_message(10), self.album_message(11)]
+        await self.remember(context, *sources)
+        status_edits = []
+
+        async def edit_status(text):
+            status_edits.append(text)
+            if len(status_edits) == 1:
+                raise TimedOut("status edit timed out")
+
+        batch_status = SimpleNamespace(
+            message_id=720,
+            edit_text=AsyncMock(side_effect=edit_status),
+        )
+        command = self.command_message(sources[0], [batch_status])
+        downloader = SimpleNamespace(
+            get_media_group_documents=AsyncMock(return_value=[])
+        )
+        split_result = SplitResult(
+            bw_path=Path("/tmp/result_BW.pdf"),
+            color_path=None,
+            bw_pages=1,
+            color_pages=0,
+            guide="",
+        )
+
+        async def download(_context, document, chat_id, message_id, **_kwargs):
+            return f"uploads/{chat_id}/{message_id}/{document.file_name}"
+
+        with (
+            patch("bot.utils.is_user_authorized", return_value=True),
+            patch(
+                "bot.utils._get_mtproto_downloader",
+                return_value=downloader,
+            ),
+            patch(
+                "bot.utils._download_pdf_document",
+                new_callable=AsyncMock,
+                side_effect=download,
+            ) as download_pdf,
+            patch(
+                "bot.utils._split_pdf_with_progress",
+                new_callable=AsyncMock,
+                return_value=split_result,
+            ),
+            patch(
+                "bot.utils._send_pdf_with_retry",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "bot.utils.asyncio.sleep",
+                new_callable=AsyncMock,
+            ) as sleep,
+        ):
+            completed = await split_pdf(self.update(command), context)
+
+        self.assertTrue(completed)
+        self.assertEqual(download_pdf.await_count, 2)
+        command.reply_text.assert_awaited_once()
+        sleep.assert_awaited_once_with(1)
+        self.assertEqual(
+            status_edits[-1],
+            "✅ All PDFs have been processed: 2/2 completed.",
+        )
 
 
 class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
@@ -793,6 +1317,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
         message = SimpleNamespace(
             from_user=SimpleNamespace(id=100, username="user"),
             message_id=50,
+            media_group_id="album-one",
             document=SimpleNamespace(
                 file_id="ordinary-file-id",
                 file_name="ordinary.pdf",
@@ -804,6 +1329,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         context = SimpleNamespace(
             bot=SimpleNamespace(get_file=AsyncMock()),
+            bot_data={},
             user_data={},
             chat_data={},
         )
@@ -814,6 +1340,10 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
         context.bot.get_file.assert_not_awaited()
         authorized.assert_not_called()
         message.reply_text.assert_not_awaited()
+        cached = context.bot_data["_pdf_media_groups"][
+            (-500, "album-one")
+        ]["items"]
+        self.assertEqual(list(cached), [50])
 
     async def test_pending_file_not_replying_to_prompt_is_ignored(self):
         message = SimpleNamespace(

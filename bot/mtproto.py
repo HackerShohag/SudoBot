@@ -14,6 +14,7 @@ import inspect
 import os
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeAlias
 from uuid import uuid4
@@ -47,6 +48,24 @@ class MtprotoPathError(MtprotoError, ValueError):
 
 class MtprotoDownloadError(MtprotoError):
     """Telegram could not download the selected file over MTProto."""
+
+
+class MtprotoMediaGroupError(MtprotoError):
+    """Telegram could not enumerate the selected media group."""
+
+
+@dataclass(frozen=True)
+class MtprotoDocument:
+    """Transport-neutral document metadata returned from an MTProto album."""
+
+    message_id: int
+    media_group_id: str
+    file_id: str
+    file_unique_id: str | None
+    file_name: str | None
+    mime_type: str | None
+    file_size: int | None
+    mtproto_only: bool = True
 
 
 def _load_client_factory() -> Callable[..., Any]:
@@ -259,6 +278,75 @@ class MtprotoDownloader:
                     except OSError:
                         pass
 
+    async def get_media_group_documents(
+        self,
+        chat_id: int | str,
+        message_id: int,
+    ) -> list[MtprotoDocument]:
+        """Return document members of the exact album containing a message."""
+        if not isinstance(message_id, int) or isinstance(message_id, bool):
+            raise MtprotoMediaGroupError(
+                "The selected album message ID is invalid."
+            )
+        if message_id <= 0:
+            raise MtprotoMediaGroupError(
+                "The selected album message ID must be positive."
+            )
+        if not isinstance(chat_id, (int, str)) or isinstance(chat_id, bool):
+            raise MtprotoMediaGroupError(
+                "The selected album chat ID is invalid."
+            )
+
+        async with self._transfer_lock:
+            client = await self._start_client()
+            try:
+                messages = await client.get_media_group(chat_id, message_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise MtprotoMediaGroupError(
+                    "Telegram could not retrieve all items in this album."
+                ) from exc
+
+        target_media_group_id = next(
+            (
+                str(getattr(message, "media_group_id"))
+                for message in messages
+                if getattr(message, "id", None) == message_id
+                and getattr(message, "media_group_id", None)
+            ),
+            None,
+        )
+        if target_media_group_id is None:
+            raise MtprotoMediaGroupError(
+                "Telegram did not return the selected album message."
+            )
+
+        documents = {}
+        for message in messages:
+            document = getattr(message, "document", None)
+            current_message_id = getattr(message, "id", None)
+            media_group_id = getattr(message, "media_group_id", None)
+            file_id = getattr(document, "file_id", None)
+            if (
+                document is None
+                or not isinstance(current_message_id, int)
+                or not media_group_id
+                or str(media_group_id) != target_media_group_id
+                or not file_id
+            ):
+                continue
+            documents[current_message_id] = MtprotoDocument(
+                message_id=current_message_id,
+                media_group_id=str(media_group_id),
+                file_id=file_id,
+                file_unique_id=getattr(document, "file_unique_id", None),
+                file_name=getattr(document, "file_name", None),
+                mime_type=getattr(document, "mime_type", None),
+                file_size=getattr(document, "file_size", None),
+            )
+        return [documents[key] for key in sorted(documents)]
+
     async def close(self) -> None:
         """Stop the in-memory bot session and permanently close this instance."""
         async with self._transfer_lock:
@@ -284,8 +372,10 @@ __all__ = [
     "MtprotoConnectionError",
     "MtprotoDependencyError",
     "MtprotoDownloadError",
+    "MtprotoDocument",
     "MtprotoDownloader",
     "MtprotoError",
+    "MtprotoMediaGroupError",
     "MtprotoPathError",
     "ProgressCallback",
 ]

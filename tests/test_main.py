@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import main as main_module
-from telegram.ext import CommandHandler
+from telegram.ext import CommandHandler, MessageHandler
 
 
 class MainTests(unittest.IsolatedAsyncioTestCase):
@@ -67,6 +67,15 @@ class MainTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("authorize", registered_commands)
         self.assertIn("unauthorize", registered_commands)
         self.assertIn("remove", registered_commands)
+
+        album_observers = [
+            call
+            for call in application.add_handler.call_args_list
+            if isinstance(call.args[0], MessageHandler)
+            and call.args[0].callback is main_module.observe_pdf_upload
+        ]
+        self.assertEqual(len(album_observers), 1)
+        self.assertEqual(album_observers[0].kwargs.get("group"), -1)
 
     async def test_application_error_handler_logs_context_exception(self):
         error = RuntimeError("handler failed")

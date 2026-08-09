@@ -16,17 +16,27 @@ SudoBot is a powerful **Telegram Bot** that allows users to execute commands, re
 
 You can use the PDF splitter in any of these ways:
 
-1. Reply to a specific PDF with `/splitpdf` or `/splitpdf --duplex`.
+1. Reply to a specific PDF with `/splitpdf` or `/splitpdf --duplex`. If it is
+   part of a Telegram album, the PDFs in that exact album are processed in
+   message order, one at a time.
 2. Upload a PDF with `/splitpdf` or `/splitpdf --duplex` as its caption.
 3. If prompted for a file, reply directly to that bot prompt with the PDF.
 
-Ordinary documents are ignored and are never downloaded by the bot.
+Several separately sent files are not an album and cannot be inferred from one
+reply. Non-PDF album members are skipped. A command used as a document caption
+processes that document only.
 
-The bot keeps one status message updated while it downloads the selected PDF,
-splits each page, uploads the B&W and color results, and finishes. Result
-uploads show streamed bytes, percentage, elapsed time, and retry attempts in
-that same status message. Files up to 20 MB use Telegram's hosted Bot API.
-Larger files automatically use a direct MTProto download when
+Ordinary document contents are never downloaded unless you explicitly select
+them. The bot temporarily remembers only lightweight PDF album metadata so a
+later reply can select the complete album.
+
+For one PDF or a PDF album, the bot keeps one status message updated while it
+downloads, splits, uploads, and finishes. Album progress moves through each PDF
+in order and ends by confirming that all PDFs were processed; each B&W/color
+result still replies to its matching source PDF. Upload statuses show streamed
+bytes, percentage, elapsed time, and retry attempts. Files up to 20 MB use
+Telegram's hosted Bot API. Larger files automatically use a direct MTProto
+download when
 `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are configured; no Docker or local
 Bot API server is required.
 
@@ -35,11 +45,12 @@ summary. Duplex mode preserves page positions with blanks and includes the
 printing guide showing the sheet side where each color page must be
 overprinted. `/printer` is an alias for `/splitpdf`.
 
-In privacy-enabled Telegram groups, the Bot API may not expose a PDF that was
-sent before the command. If that happens, the bot prompts for the file: reply
-directly to the bot's prompt with the PDF and it will split it automatically.
-Disabling group privacy for the bot through BotFather also lets it receive
-ordinary file messages.
+In privacy-enabled Telegram groups, the Bot API may not expose files sent before
+the command. A standalone PDF can be supplied through the bot's re-upload
+prompt. Complete album recovery additionally needs Privacy Mode disabled for
+the bot through BotFather, or working `TELEGRAM_API_ID` and
+`TELEGRAM_API_HASH` credentials so the bot can retrieve that exact media group
+directly.
 
 ---
 
@@ -133,8 +144,9 @@ SUPER_ADMIN_USERNAME=your_telegram_username
 - Keep the bot token and API hash private. The running bot authenticates its
   own bot account with the bot token; it does not log in as your personal
   Telegram account and does not ask for a phone code at runtime.
-- The two Telegram API values are optional for ordinary commands and PDFs up
-  to 20 MB, but both are required for the automatic large-file fallback.
+- The two Telegram API values are optional for ordinary commands and standalone
+  PDFs up to 20 MB. Both are required for the automatic large-file fallback and
+  for recovering complete PDF albums after a restart or a metadata cache miss.
 - Set `SUPER_ADMIN_USERNAME` to your Telegram username without `@`. This
   explicitly configured account can bootstrap authorization on a fresh
   install and is the only account allowed to run host commands.

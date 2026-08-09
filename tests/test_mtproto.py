@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from bot.mtproto import (
@@ -10,6 +11,7 @@ from bot.mtproto import (
     MtprotoDependencyError,
     MtprotoDownloadError,
     MtprotoDownloader,
+    MtprotoMediaGroupError,
     MtprotoPathError,
 )
 
@@ -18,6 +20,9 @@ class FakeClient:
     instances = []
     active_downloads = 0
     maximum_active_downloads = 0
+    media_group_calls = []
+    media_group_messages = []
+    media_group_error = None
 
     def __init__(self, name, **kwargs):
         self.name = name
@@ -49,6 +54,12 @@ class FakeClient:
         finally:
             type(self).active_downloads -= 1
 
+    async def get_media_group(self, chat_id, message_id):
+        type(self).media_group_calls.append((chat_id, message_id))
+        if type(self).media_group_error is not None:
+            raise type(self).media_group_error
+        return type(self).media_group_messages
+
 
 class MtprotoConfigurationTests(unittest.TestCase):
     def test_credentials_are_validated_without_importing_kurigram(self):
@@ -74,6 +85,9 @@ class MtprotoDownloaderTests(unittest.IsolatedAsyncioTestCase):
         FakeClient.instances.clear()
         FakeClient.active_downloads = 0
         FakeClient.maximum_active_downloads = 0
+        FakeClient.media_group_calls.clear()
+        FakeClient.media_group_messages = []
+        FakeClient.media_group_error = None
         self.downloader = MtprotoDownloader(
             api_id="12345",
             api_hash="a" * 32,
@@ -212,6 +226,86 @@ class MtprotoDownloaderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(StartFailureClient.instances[-1].stopped, 1)
         await downloader.close()
+
+    async def test_media_group_documents_are_exact_sorted_and_normalized(self):
+        def document(file_id, name, mime_type="application/pdf"):
+            return SimpleNamespace(
+                file_id=file_id,
+                file_unique_id=f"unique-{file_id}",
+                file_name=name,
+                mime_type=mime_type,
+                file_size=123,
+            )
+
+        FakeClient.media_group_messages = [
+            SimpleNamespace(
+                id=12,
+                media_group_id=700,
+                document=document("third", "third.pdf"),
+            ),
+            SimpleNamespace(
+                id=10,
+                media_group_id=700,
+                document=document("first", "first.pdf"),
+            ),
+            # A non-document member in the selected album is ignored.
+            SimpleNamespace(id=11, media_group_id=700, document=None),
+            # Defensive filtering must never include a neighboring album.
+            SimpleNamespace(
+                id=13,
+                media_group_id=701,
+                document=document("unrelated", "unrelated.pdf"),
+            ),
+        ]
+
+        documents = await self.downloader.get_media_group_documents(-500, 10)
+
+        self.assertEqual(FakeClient.media_group_calls, [(-500, 10)])
+        self.assertEqual([item.message_id for item in documents], [10, 12])
+        self.assertEqual([item.file_name for item in documents], [
+            "first.pdf",
+            "third.pdf",
+        ])
+        self.assertEqual(documents[0].media_group_id, "700")
+        self.assertEqual(documents[0].file_unique_id, "unique-first")
+        self.assertEqual(documents[0].file_size, 123)
+        self.assertTrue(documents[0].mtproto_only)
+
+    async def test_media_group_lookup_errors_are_typed(self):
+        FakeClient.media_group_error = RuntimeError("history unavailable")
+
+        with self.assertRaisesRegex(
+            MtprotoMediaGroupError,
+            "could not retrieve all items",
+        ):
+            await self.downloader.get_media_group_documents(-500, 10)
+
+    async def test_media_group_requires_the_selected_message(self):
+        FakeClient.media_group_messages = [
+            SimpleNamespace(
+                id=11,
+                media_group_id=700,
+                document=SimpleNamespace(
+                    file_id="file-id",
+                    file_unique_id="unique-id",
+                    file_name="file.pdf",
+                    mime_type="application/pdf",
+                    file_size=123,
+                ),
+            )
+        ]
+
+        with self.assertRaisesRegex(
+            MtprotoMediaGroupError,
+            "selected album message",
+        ):
+            await self.downloader.get_media_group_documents(-500, 10)
+
+    async def test_media_group_rejects_invalid_message_id_before_connecting(self):
+        with self.assertRaisesRegex(MtprotoMediaGroupError, "positive"):
+            await self.downloader.get_media_group_documents(-500, 0)
+
+        self.assertEqual(FakeClient.instances, [])
 
 
 class MtprotoLazyDependencyTests(unittest.IsolatedAsyncioTestCase):

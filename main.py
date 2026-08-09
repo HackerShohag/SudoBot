@@ -16,6 +16,7 @@ from bot.utils import (
     authorize_user,
     close_mtproto_downloader,
     handle_file_upload,
+    observe_pdf_upload,
     remove_user,
     split_pdf,
 )
@@ -46,6 +47,13 @@ async def main():
         .media_write_timeout(300)
         .pool_timeout(30)
         .build()
+    )
+
+    # Record album membership without downloading ordinary/unselected files.
+    # A separate group keeps observation active during other conversations.
+    application.add_handler(
+        MessageHandler(filters.Document.ALL, observe_pdf_upload),
+        group=-1,
     )
 
     application.add_handler(
