@@ -1,14 +1,17 @@
 import asyncio
 from dataclasses import dataclass, field
+import html
 import logging
 import re
 import shlex
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import ContextTypes, ConversationHandler, CallbackContext
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
-from bot.keyboard import update_command_history
+from bot.keyboard import update_command_history, update_keyboard
 from bot.utils import is_super_admin
-from bot.config import MAX_CHARS
+from bot.config import INSTANCE_ROLE, MAX_CHARS
+from bot.ha import server_command
 from bot.task_registry import (
     cancel_chat_tasks,
     has_stopping_tasks,
@@ -31,6 +34,65 @@ STATUS_EDIT_INTERVAL = 4.0
 OUTPUT_TAIL_CHARS = 32_768
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+SENSITIVE_PATH_RE = re.compile(
+    r"(?i)(?<![a-z0-9_])(?:\.env(?:\.[a-z0-9_-]+)?|"
+    r"/proc/(?:self|[0-9]+)/environ)(?![a-z0-9_])"
+)
+SENSITIVE_EXPANSION_RE = re.compile(
+    r"(?i)\$(?:\{)?[a-z0-9_]*(?:token|secret|password|api_hash|private_key)"
+    r"[a-z0-9_]*(?:\})?"
+)
+ENVIRONMENT_DUMP_RE = re.compile(
+    r"(?i)(?:^|[;&|]\s*)(?:sudo\s+)?(?:/usr/bin/)?"
+    r"(?:env|printenv|compgen\s+-e)(?:\s|$)|"
+    r"(?:^|[;&|]\s*)(?:export|declare)\s+-p(?:\s|$)|"
+    r"(?:^|[;&|]\s*)set\s*(?:$|[;&|])"
+)
+COMMAND_ENV_ALLOWLIST = {
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "SSH_AUTH_SOCK",
+    "TERM",
+    "TMPDIR",
+    "USER",
+    "XDG_RUNTIME_DIR",
+}
+
+
+def _command_security_error(command: str) -> str | None:
+    """Return a user-safe reason when a command directly targets secrets."""
+    if SENSITIVE_PATH_RE.search(command):
+        return "access to protected environment files is not allowed"
+    if SENSITIVE_EXPANSION_RE.search(command):
+        return "expansion of sensitive environment variables is not allowed"
+    if ENVIRONMENT_DUMP_RE.search(command):
+        return "dumping the process environment is not allowed"
+    return None
+
+
+def _command_environment() -> dict[str, str]:
+    """Pass only ordinary runtime variables, never the bot's loaded .env."""
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name in COMMAND_ENV_ALLOWLIST
+    }
+
+
+async def _reject_unsafe_command(update, command: str, reply_to_message_id) -> bool:
+    reason = _command_security_error(command)
+    if reason is None:
+        return False
+    await update.message.reply_text(
+        f"🛡️ Command blocked by the security checkpoint: {reason}.",
+        reply_to_message_id=reply_to_message_id,
+    )
+    return True
 
 
 def _message_limit() -> int:
@@ -110,7 +172,10 @@ class _ActiveCommand:
     termination_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-_active_commands: dict[tuple[str, object], _ActiveCommand] = {}
+_active_commands: dict[
+    tuple[str, object],
+    dict[int, _ActiveCommand],
+] = {}
 
 
 def _command_chat_key(update) -> tuple[str, object]:
@@ -131,11 +196,20 @@ def _command_chat_key(update) -> tuple[str, object]:
     return ("user", user_id if user_id is not None else id(update))
 
 
+def _commands_for_chat(chat_key) -> list[_ActiveCommand]:
+    return list(_active_commands.get(chat_key, {}).values())
+
+
+def _remember_active_command(active: _ActiveCommand) -> None:
+    _active_commands.setdefault(active.chat_key, {})[id(active)] = active
+
+
 async def _send_status(update, text: str, reply_to_message_id) -> _StatusMessage:
     text = _limit_message(text)
     message = await update.message.reply_text(
         text,
         reply_to_message_id=reply_to_message_id,
+        parse_mode=ParseMode.HTML,
     )
     return _StatusMessage(message=message, last_text=text)
 
@@ -149,7 +223,7 @@ async def _edit_status(status: _StatusMessage, text: str) -> bool:
     network_attempts = 0
     while True:
         try:
-            await status.message.edit_text(text)
+            await status.message.edit_text(text, parse_mode=ParseMode.HTML)
         except RetryAfter as exc:
             await asyncio.sleep(_retry_after_seconds(exc.retry_after))
             continue
@@ -187,20 +261,36 @@ def _format_elapsed(seconds: float) -> str:
     return f"{seconds}s"
 
 
+def _escaped_tail(text: str, budget: int) -> str:
+    """Return the longest HTML-escaped suffix that fits *budget*."""
+    if budget <= 0:
+        return ""
+    low, high = 0, len(text)
+    while low < high:
+        size = (low + high + 1) // 2
+        if len(html.escape(text[-size:])) <= budget:
+            low = size
+        else:
+            high = size - 1
+    return html.escape(text[-low:]) if low else ""
+
+
 def _render_stream(label: str, output: _OutputBuffer, limit: int) -> str:
-    prefix = f"{label}:\n"
-    available = max(1, limit - len(prefix))
+    prefix = f"{label}:\n<pre>"
+    suffix = "</pre>"
+    available = max(1, limit - len(prefix) - len(suffix))
 
     if output.total_chars == 0:
-        return f"{prefix}(no output)"
+        return f"{prefix}(no output){suffix}"
 
     value = output.tail.rstrip("\n") or "(whitespace only)"
-    if len(value) <= available and output.total_chars <= len(output.tail):
-        return f"{prefix}{value}"
+    escaped = html.escape(value)
+    if len(escaped) <= available and output.total_chars <= len(output.tail):
+        return f"{prefix}{escaped}{suffix}"
 
     marker = "… earlier output omitted …\n"
-    tail_size = max(1, available - len(marker))
-    return f"{prefix}{marker}{value[-tail_size:]}"
+    escaped_value = _escaped_tail(value, available - len(marker))
+    return f"{prefix}{marker}{escaped_value}{suffix}"
 
 
 def _render_streams(
@@ -210,11 +300,11 @@ def _render_streams(
     *,
     include_empty: bool,
 ) -> str:
-    streams = [("stdout", stdout), ("stderr", stderr)]
-    if not include_empty:
-        streams = [(label, output) for label, output in streams if output.total_chars]
-        if not streams:
-            return "Waiting for output…"
+    # stdout is the primary result and remains visible even while empty. stderr
+    # is noise in the common success case, so only reveal it once it has data.
+    streams = [("stdout", stdout)]
+    if stderr.total_chars:
+        streams.append(("stderr", stderr))
 
     separator_size = 2 * (len(streams) - 1)
     per_stream = max(40, (budget - separator_size) // len(streams))
@@ -239,7 +329,7 @@ def _running_text(active: _ActiveCommand, elapsed: float, frame: int) -> str:
         active.stdout,
         active.stderr,
         budget,
-        include_empty=False,
+        include_empty=True,
     )
     return _limit_message(f"{header}\n\n{output}")
 
@@ -323,7 +413,11 @@ async def _terminate_active_command(active: _ActiveCommand) -> None:
 
 
 def _forget_active_command(active: _ActiveCommand) -> None:
-    if _active_commands.get(active.chat_key) is active:
+    commands = _active_commands.get(active.chat_key)
+    if commands is None:
+        return
+    commands.pop(id(active), None)
+    if not commands:
         _active_commands.pop(active.chat_key, None)
 
 
@@ -348,11 +442,7 @@ async def _execute_active_command(
 
         active.status = await _send_status(
             update,
-            (
-                f"⠋ Running {active.subject.casefold()}…\n"
-                "Elapsed: 0s\n\n"
-                "Waiting for output…"
-            ),
+            _running_text(active, 0, 0),
             reply_to_message_id,
         )
 
@@ -377,6 +467,7 @@ async def _execute_active_command(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                env=_command_environment(),
             )
         finally:
             active.spawning = False
@@ -392,6 +483,11 @@ async def _execute_active_command(
         except Exception as exc:
             # Command history is a convenience and must never prevent execution.
             logger.warning("Could not update command history: %s", exc)
+        try:
+            await update_keyboard(update, context)
+        except Exception as exc:
+            # Telegram or database trouble must not interrupt the host command.
+            logger.warning("Could not update command keyboard: %s", exc)
 
         drain_tasks = [
             asyncio.create_task(_drain_stream(process.stdout, active.stdout)),
@@ -501,23 +597,16 @@ async def _launch_command(
     *,
     subject: str = "Command",
 ) -> bool:
-    """Reserve a chat slot and detach command work from Telegram dispatch."""
+    """Reserve and detach command work from Telegram dispatch."""
     if not is_super_admin(update.message.from_user):
         await update.message.reply_text(
             "❌ Only the super admin can run host commands."
         )
         return False
-
-    chat_key = _command_chat_key(update)
-    existing = _active_commands.get(chat_key)
-    if existing is not None:
-        await update.message.reply_text(
-            "⚠️ Another host command is already running in this chat. "
-            "Stop it with /stop first.",
-            reply_to_message_id=reply_to_message_id,
-        )
+    if await _reject_unsafe_command(update, command, reply_to_message_id):
         return False
 
+    chat_key = _command_chat_key(update)
     # Reserve before the first await/task switch. This makes an immediately
     # following /stop see the launch even before a subprocess handle exists.
     active = _ActiveCommand(
@@ -525,7 +614,7 @@ async def _launch_command(
         started_at=asyncio.get_running_loop().time(),
         subject=subject,
     )
-    _active_commands[chat_key] = active
+    _remember_active_command(active)
     coroutine = _execute_active_command(
         active,
         command,
@@ -537,7 +626,10 @@ async def _launch_command(
         active.task = context.application.create_task(
             coroutine,
             update=update,
-            name=f"host-command:{chat_key[0]}:{chat_key[1]}",
+            name=(
+                f"host-command:{chat_key[0]}:{chat_key[1]}:"
+                f"{reply_to_message_id}"
+            ),
         )
         active.task.add_done_callback(
             lambda _completed: _forget_active_command(active)
@@ -568,23 +660,17 @@ async def execute_command(
             "❌ Only the super admin can run host commands."
         )
         return
-
-    chat_key = _command_chat_key(update)
-    if chat_key in _active_commands:
-        await update.message.reply_text(
-            "⚠️ Another host command is already running in this chat. "
-            "Stop it with /stop first.",
-            reply_to_message_id=reply_to_message_id,
-        )
+    if await _reject_unsafe_command(update, command, reply_to_message_id):
         return
 
+    chat_key = _command_chat_key(update)
     active = _ActiveCommand(
         chat_key=chat_key,
         started_at=asyncio.get_running_loop().time(),
         subject=subject,
         task=asyncio.current_task(),
     )
-    _active_commands[chat_key] = active
+    _remember_active_command(active)
     register_task(update, active.task, "Host command")
     await _execute_active_command(
         active,
@@ -631,18 +717,46 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    command = ' '.join(context.args)
+    arguments = list(context.args)
+    run_on_server = bool(arguments and arguments[0] == "--server")
+    if run_on_server:
+        arguments.pop(0)
+    command = " ".join(arguments)
 
     if not command:
         # TODO: autofill the input field with the /run command so the user can just type the command
-        await update.message.reply_text("Please provide a command to run.", reply_to_message_id=update.message.message_id)
+        usage = "/run [--server] <command>"
+        await update.message.reply_text(
+            f"Please provide a command to run. Usage: {usage}",
+            reply_to_message_id=update.message.message_id,
+        )
         return
 
-    if command.startswith("sudo"):
-        if _command_chat_key(update) in _active_commands:
+    subject = "Command"
+    if run_on_server:
+        if INSTANCE_ROLE == "local":
+            try:
+                command = server_command(command)
+            except RuntimeError as exc:
+                await update.message.reply_text(
+                    f"❌ Server routing is not configured: {exc}",
+                    reply_to_message_id=update.message.message_id,
+                )
+                return
+        elif INSTANCE_ROLE != "server":
             await update.message.reply_text(
-                "⚠️ Another host command is already running in this chat. "
-                "Stop it with /stop first.",
+                "❌ /run --server requires INSTANCE_ROLE=local or server.",
+                reply_to_message_id=update.message.message_id,
+            )
+            return
+        subject = "Server command"
+
+    if command.startswith("sudo") and not (
+        run_on_server and INSTANCE_ROLE == "local"
+    ):
+        if context.chat_data.get("sudo_command"):
+            await update.message.reply_text(
+                "⚠️ A sudo password prompt is already pending in this chat.",
                 reply_to_message_id=update.message.message_id,
             )
             return
@@ -652,12 +766,21 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data['sudo_password_message_id'] = message.message_id
         return AWAITING_SUDO_PASSWORD
 
-    await _launch_command(
-        command,
-        update,
-        context,
-        update.message.message_id,
-    )
+    if run_on_server:
+        await _launch_command(
+            command,
+            update,
+            context,
+            update.message.message_id,
+            subject=subject,
+        )
+    else:
+        await _launch_command(
+            command,
+            update,
+            context,
+            update.message.message_id,
+        )
 
 async def password_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_super_admin(update.message.from_user):
@@ -750,55 +873,49 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             coroutine.close()
             logger.warning("Could not schedule the pending PDF prompt update")
 
-    active = _active_commands.get(_command_chat_key(update))
-    host_stopping = False
+    active_commands = _commands_for_chat(_command_chat_key(update))
+    host_stopping = []
     already_stopping = False
     excluded_tasks = {asyncio.current_task()}
-    if (
-        active is not None
-        and not (
+    for active in active_commands:
+        if (
             active.process is not None
             and active.process.returncode is not None
-        )
-    ):
-        already_stopping = active.stop_requested
-        if not already_stopping:
-            # Mark synchronously before yielding. If the child already exists,
-            # signal its process group immediately; the background finisher owns
-            # the grace period and SIGKILL escalation.
-            active.stop_requested = True
-            host_stopping = True
-            process = active.process
-            if process is not None and process.returncode is None:
-                try:
-                    _signal_process(process, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+        ):
+            continue
+        if active.stop_requested:
+            already_stopping = True
+            continue
 
-            # Cancellation during create_subprocess_shell can lose a newly
-            # created child before Python exposes its handle. Let the runner's
-            # post-spawn stop check own that narrow phase.
-            if active.spawning and active.task is not None:
-                excluded_tasks.add(active.task)
+        # Mark all commands synchronously before yielding. Each runner owns its
+        # own process group and final status message.
+        active.stop_requested = True
+        host_stopping.append(active)
+        process = active.process
+        if process is not None and process.returncode is None:
+            try:
+                _signal_process(process, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+        # Cancellation during create_subprocess_shell can lose a newly created
+        # child before Python exposes its handle. Let that runner's post-spawn
+        # stop check own its narrow phase.
+        if active.spawning and active.task is not None:
+            excluded_tasks.add(active.task)
 
     cancelled = cancel_chat_tasks(
         update,
         exclude=excluded_tasks,
     )
-    host_task_cancelled = bool(
-        active is not None
-        and any(task is active.task for task, _label in cancelled)
-    )
+    cancelled_tasks = {task for task, _label in cancelled}
 
     # A host runner created by an internal caller may not be cancellable. Its
     # process was already signalled above, so finish the grace-period handling
     # without blocking Telegram update processing.
-    if (
-        host_stopping
-        and not host_task_cancelled
-        and active is not None
-        and not active.spawning
-    ):
+    for active in host_stopping:
+        if active.task in cancelled_tasks or active.spawning:
+            continue
         coroutine = _finish_stop_request(active)
         try:
             context.application.create_task(
@@ -806,7 +923,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 update=update,
                 name=(
                     "stop-host-command:"
-                    f"{active.chat_key[0]}:{active.chat_key[1]}"
+                    f"{active.chat_key[0]}:{active.chat_key[1]}:{id(active)}"
                 ),
             )
         except Exception:
@@ -815,7 +932,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _terminate_active_command(active)
 
     stopped_count = (
-        int(host_stopping and not host_task_cancelled)
+        sum(active.task not in cancelled_tasks for active in host_stopping)
         + len(cancelled)
         + int(had_pending_sudo)
         + int(had_pending_pdf)

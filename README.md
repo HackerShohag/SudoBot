@@ -4,6 +4,8 @@ SudoBot is a powerful **Telegram Bot** that allows users to execute commands, re
 
 ## 🚀 Features
 - ✅ **Command Execution:** Run shell commands remotely as the configured super admin.
+- ⚡ **Parallel Commands:** Run multiple host commands concurrently in one chat,
+  each with its own live status message.
 - ⏱️ **Live Command Status:** Follow elapsed time and streamed output in one edited message.
 - 🛑 **Chat-wide Stop:** `/stop` interrupts all work running in that chat,
   including shell commands, PDF processing, monitors, and system/IP lookups.
@@ -15,7 +17,8 @@ SudoBot is a powerful **Telegram Bot** that allows users to execute commands, re
 - 🖨️ **PDF Print Splitting:** Separate uploaded PDFs into B&W and color files.
 
 Long-running work does not block Telegram update handling, so other commands
-and `/stop` remain responsive while jobs are in progress. The five-minute
+and `/stop` remain responsive while jobs are in progress. `/stop` terminates
+all concurrently running work in the requesting chat. The five-minute
 system monitor targets one refreshed reading per second; Telegram rate limits
 or network delays can temporarily make an individual update arrive later.
 
@@ -137,6 +140,7 @@ cp .env.sample .env
 ### 📌 Edit `.env` File
 ```ini
 BOT_TOKEN=your_telegram_bot_token
+INSTANCE_ROLE=standalone
 TELEGRAM_API_ID=your_numeric_api_id
 TELEGRAM_API_HASH=your_api_hash
 SUPER_ADMIN_USERNAME=your_telegram_username
@@ -158,6 +162,58 @@ SUPER_ADMIN_USERNAME=your_telegram_username
 - Set `SUPER_ADMIN_USERNAME` to your Telegram username without `@`. This
   explicitly configured account can bootstrap authorization on a fresh
   install and is the only account allowed to run host commands.
+
+### Single-token high availability
+
+Both machines use the same `BOT_TOKEN`; there is no main token or backup
+token. Only one machine polls Telegram at a time.
+
+On the local primary, configure:
+
+```ini
+INSTANCE_ROLE=local
+SERVER_SSH_HOST=server.example.com
+SERVER_SSH_USER=botuser
+SERVER_SSH_PORT=22
+SERVER_SSH_KEY=/absolute/path/to/private_key
+SERVER_SSH_KNOWN_HOSTS=/absolute/path/to/known_hosts
+HA_HEARTBEAT_FILE=/tmp/sudobot-primary.heartbeat
+HEARTBEAT_INTERVAL=30
+FAILOVER_TIMEOUT=90
+```
+
+Use `INSTANCE_ROLE=server` on the standby server, with the same heartbeat file
+and timing values. The local process polls Telegram and touches the server-side
+heartbeat file over SSH every 30 seconds. The server process does not contact
+Telegram while it is on standby. If the file is not refreshed for 90 seconds,
+the server starts the normal bot with the same `BOT_TOKEN`.
+
+Configure key-based, non-interactive SSH from the local bot account to the
+server and add the server host key to `SERVER_SSH_KNOWN_HOSTS`. Verify it before
+starting HA mode:
+
+```bash
+ssh -i /absolute/path/to/private_key botuser@server.example.com true
+```
+
+Host commands use this mapping:
+
+```text
+/run <command>            run on the currently active machine
+/run --server <command>   run on the server
+```
+
+While the local primary is active, `--server` uses SSH and feeds the remote
+stdout/stderr into the existing live Telegram status. After server takeover,
+`--server` executes directly because the active machine is already the server.
+Remote `sudo` commands must be allowed non-interactively for the SSH account
+(for example, narrowly scoped passwordless sudo); the bot does not transmit a
+sudo password over the relay.
+
+Failover is automatic, but failback is intentionally manual. Before restarting
+the local primary after a server promotion, stop the active server bot and
+restart its standby service. Network partitions can still produce split-brain;
+strict fencing requires an independent lease/consensus service.
 
 ---
 

@@ -1,6 +1,9 @@
 import asyncio
 from functools import wraps
 import logging
+import os
+import shlex
+import time
 
 from telegram.ext import (
     Application,
@@ -10,7 +13,14 @@ from telegram.ext import (
     filters,
 )
 
-from bot.config import BOT_TOKEN
+from bot.config import (
+    BOT_TOKEN,
+    FAILOVER_TIMEOUT,
+    HA_HEARTBEAT_FILE,
+    HEARTBEAT_INTERVAL,
+    INSTANCE_ROLE,
+)
+from bot.ha import server_ssh_args
 from bot.bot import run_command, password_input, stop_command, AWAITING_SUDO_PASSWORD
 from bot import menu
 from bot.utils import (
@@ -72,7 +82,8 @@ async def handle_application_error(update, context):
         exc_info=context.error,
     )
 
-async def main():
+def build_main_application():
+    """Build the user-facing application without starting its lifecycle."""
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -148,15 +159,146 @@ async def main():
     )
     application.add_error_handler(handle_application_error)
 
+    return application
+
+
+async def _stop_application(application) -> None:
+    if application.updater and getattr(application.updater, "running", False):
+        await application.updater.stop()
+    if getattr(application, "running", False):
+        await application.stop()
+    shutdown = getattr(application, "shutdown", None)
+    if shutdown is not None:
+        await shutdown()
+
+
+async def send_primary_heartbeats() -> None:
+    """Touch a server-side lease file over SSH every configured interval."""
+    ssh_args = server_ssh_args()
+    remote_command = f"touch -- {shlex.quote(HA_HEARTBEAT_FILE)}"
+    while True:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *ssh_args,
+                remote_command,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=min(HEARTBEAT_INTERVAL, 20),
+                )
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                raise
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+                logger.warning("Server heartbeat SSH command timed out")
+            else:
+                if process.returncode:
+                    detail = stderr.decode(errors="replace").strip()
+                    logger.warning(
+                        "Server heartbeat failed (exit %s): %s",
+                        process.returncode,
+                        detail[-500:],
+                    )
+        except OSError as exc:
+            logger.warning("Could not start heartbeat SSH command: %s", exc)
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
+async def run_main_bot(*, send_heartbeats: bool) -> None:
+    """Run the sole Telegram poller using BOT_TOKEN."""
+    application = build_main_application()
+    heartbeat_task = None
+    initialized = False
+
     try:
         await application.initialize()
-        print("Bot is running...", flush=True)
+        initialized = True
         await menu.set_bot_menu(application)
         await application.start()
         await application.updater.start_polling()
+        if send_heartbeats:
+            heartbeat_task = asyncio.create_task(
+                send_primary_heartbeats(),
+                name="primary-heartbeat",
+            )
+        print(f"Bot is running on {INSTANCE_ROLE}...", flush=True)
         await asyncio.Future()
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        if initialized:
+            await _stop_application(application)
         await close_mtproto_downloader()
+
+
+async def wait_for_primary_timeout() -> None:
+    """Watch the local lease file without contacting the Telegram API."""
+    loop = asyncio.get_running_loop()
+    last_heartbeat = loop.time()
+    last_mtime_ns = None
+
+    print(
+        f"Server standby is monitoring {HA_HEARTBEAT_FILE}; "
+        f"timeout is {FAILOVER_TIMEOUT:g}s...",
+        flush=True,
+    )
+    while True:
+        try:
+            stat = os.stat(HA_HEARTBEAT_FILE)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("Could not inspect heartbeat file: %s", exc)
+        else:
+            # Only accept a newly touched, reasonably current file. This keeps
+            # a stale lease left by an old primary from extending startup.
+            age = time.time() - stat.st_mtime
+            if stat.st_mtime_ns != last_mtime_ns and -5 <= age <= FAILOVER_TIMEOUT:
+                last_mtime_ns = stat.st_mtime_ns
+                last_heartbeat = loop.time()
+                logger.info("Primary heartbeat observed")
+
+        if loop.time() - last_heartbeat >= FAILOVER_TIMEOUT:
+            logger.critical(
+                "No primary heartbeat for %.1f seconds; promoting server",
+                FAILOVER_TIMEOUT,
+            )
+            return
+        await asyncio.sleep(1)
+
+
+def validate_config() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is required")
+    if INSTANCE_ROLE not in {"standalone", "local", "server"}:
+        raise RuntimeError("INSTANCE_ROLE must be standalone, local, or server")
+    if HEARTBEAT_INTERVAL <= 0 or FAILOVER_TIMEOUT <= HEARTBEAT_INTERVAL:
+        raise RuntimeError(
+            "FAILOVER_TIMEOUT must be greater than the positive "
+            "HEARTBEAT_INTERVAL"
+        )
+    if INSTANCE_ROLE == "local":
+        # Resolve this at startup so a bad SSH configuration cannot silently
+        # leave the server without heartbeats.
+        server_ssh_args()
+
+
+async def main():
+    validate_config()
+    if INSTANCE_ROLE == "server":
+        await wait_for_primary_timeout()
+        print("Primary lease expired; starting BOT_TOKEN on server...", flush=True)
+        await run_main_bot(send_heartbeats=False)
+    else:
+        await run_main_bot(send_heartbeats=INSTANCE_ROLE == "local")
 
 if __name__ == '__main__':
     try:

@@ -80,6 +80,56 @@ class HostCommandSecurityTests(unittest.IsolatedAsyncioTestCase):
             "❌ Only the super admin can run host commands."
         )
 
+    async def test_checkpoint_blocks_environment_file_access(self):
+        update = command_update("HackerShohag")
+        context = SimpleNamespace()
+
+        with (
+            patch("bot.bot.is_super_admin", return_value=True),
+            patch(
+                "bot.bot.asyncio.create_subprocess_shell",
+                new_callable=AsyncMock,
+            ) as create_process,
+        ):
+            await execute_command("cat .env", update, context, 10)
+
+        create_process.assert_not_awaited()
+        update.message.reply_text.assert_awaited_once_with(
+            "🛡️ Command blocked by the security checkpoint: "
+            "access to protected environment files is not allowed.",
+            reply_to_message_id=10,
+        )
+
+    def test_checkpoint_covers_common_environment_leaks(self):
+        blocked = (
+            "cat /proc/self/environ",
+            "echo $BOT_TOKEN",
+            "printenv",
+            "env | sort",
+            "python -c \"print(open('.env').read())\"",
+        )
+        for command in blocked:
+            with self.subTest(command=command):
+                self.assertIsNotNone(
+                    command_bot._command_security_error(command)
+                )
+
+    def test_child_environment_uses_a_small_allowlist(self):
+        values = {
+            "PATH": "/usr/bin",
+            "HOME": "/home/bot",
+            "BOT_TOKEN": "secret-token",
+            "TELEGRAM_API_HASH": "secret-hash",
+            "AWS_ACCESS_KEY_ID": "secret-cloud-key",
+        }
+        with patch.dict(command_bot.os.environ, values, clear=True):
+            child_environment = command_bot._command_environment()
+
+        self.assertEqual(
+            child_environment,
+            {"PATH": "/usr/bin", "HOME": "/home/bot"},
+        )
+
     async def test_runfile_rejects_non_super_admin_before_subprocess(self):
         update = command_update()
         context = SimpleNamespace(args=["file.txt", "cat", "{file}"])
@@ -106,6 +156,58 @@ class HostCommandSecurityTests(unittest.IsolatedAsyncioTestCase):
             await run_command(update, context)
 
         launch.assert_awaited_once_with("whoami", update, context, 10)
+
+    async def test_server_flag_relays_from_local_instance(self):
+        update = command_update("HackerShohag")
+        context = SimpleNamespace(
+            args=["--server", "hostname"],
+            user_data={},
+            chat_data={},
+        )
+
+        with (
+            patch("bot.bot.is_super_admin", return_value=True),
+            patch.object(command_bot, "INSTANCE_ROLE", "local"),
+            patch.object(
+                command_bot,
+                "server_command",
+                return_value="ssh-safe-command",
+            ) as route,
+            patch("bot.bot._launch_command", new_callable=AsyncMock) as launch,
+        ):
+            await run_command(update, context)
+
+        route.assert_called_once_with("hostname")
+        launch.assert_awaited_once_with(
+            "ssh-safe-command",
+            update,
+            context,
+            10,
+            subject="Server command",
+        )
+
+    async def test_server_flag_executes_directly_after_server_takeover(self):
+        update = command_update("HackerShohag")
+        context = SimpleNamespace(
+            args=["--server", "hostname"],
+            user_data={},
+            chat_data={},
+        )
+
+        with (
+            patch("bot.bot.is_super_admin", return_value=True),
+            patch.object(command_bot, "INSTANCE_ROLE", "server"),
+            patch("bot.bot._launch_command", new_callable=AsyncMock) as launch,
+        ):
+            await run_command(update, context)
+
+        launch.assert_awaited_once_with(
+            "hostname",
+            update,
+            context,
+            10,
+            subject="Server command",
+        )
 
     async def test_super_admin_runfile_reaches_guarded_async_executor(self):
         update = command_update("HackerShohag")
@@ -163,7 +265,7 @@ class HostCommandSecurityTests(unittest.IsolatedAsyncioTestCase):
             started_at=asyncio.get_running_loop().time(),
             process=process,
         )
-        command_bot._active_commands[active.chat_key] = active
+        command_bot._remember_active_command(active)
         tracked_task = asyncio.create_task(asyncio.Event().wait())
         task_registry.register_task(update, tracked_task, "PDF processing")
 
@@ -174,7 +276,7 @@ class HostCommandSecurityTests(unittest.IsolatedAsyncioTestCase):
             "❌ Only the super admin can stop running tasks."
         )
         process.send_signal.assert_not_called()
-        self.assertIs(command_bot._active_commands[active.chat_key], active)
+        self.assertIn(active, command_bot._commands_for_chat(active.chat_key))
         self.assertFalse(tracked_task.done())
         self.assertEqual(
             task_registry.tracked_tasks(update),

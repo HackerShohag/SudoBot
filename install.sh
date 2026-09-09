@@ -50,6 +50,7 @@ echo "Validating bot configuration..."
     "$VENV_PATH/bin/python" -c '
 from bot.config import (
     BOT_TOKEN,
+    INSTANCE_ROLE,
     SUPER_ADMIN_USERNAME,
     TELEGRAM_API_HASH,
     TELEGRAM_API_ID,
@@ -58,6 +59,11 @@ from bot.mtproto import MtprotoDownloader
 
 if not BOT_TOKEN or BOT_TOKEN == "YOUR BOT TOKEN HERE":
     raise SystemExit("BOT_TOKEN is missing or still uses the sample value.")
+if INSTANCE_ROLE not in {"standalone", "local", "server"}:
+    raise SystemExit("INSTANCE_ROLE must be standalone, local, or server.")
+if INSTANCE_ROLE == "local":
+    from bot.ha import server_ssh_args
+    server_ssh_args()
 if not SUPER_ADMIN_USERNAME or SUPER_ADMIN_USERNAME == "your_telegram_username":
     raise SystemExit("SUPER_ADMIN_USERNAME must be set to your Telegram username.")
 if bool(TELEGRAM_API_ID) != bool(TELEGRAM_API_HASH):
