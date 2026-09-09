@@ -178,8 +178,11 @@ SERVER_SSH_PORT=22
 SERVER_SSH_KEY=/absolute/path/to/private_key
 SERVER_SSH_KNOWN_HOSTS=/absolute/path/to/known_hosts
 HA_HEARTBEAT_FILE=/tmp/sudobot-primary.heartbeat
+HA_TAKEOVER_REQUEST_FILE=/tmp/sudobot-primary.heartbeat.takeover
+HA_TAKEOVER_ACK_FILE=/tmp/sudobot-primary.heartbeat.takeover.ack
 HEARTBEAT_INTERVAL=30
 FAILOVER_TIMEOUT=90
+FAILBACK_TIMEOUT=30
 ```
 
 Use `INSTANCE_ROLE=server` on the standby server, with the same heartbeat file
@@ -210,10 +213,16 @@ Remote `sudo` commands must be allowed non-interactively for the SSH account
 (for example, narrowly scoped passwordless sudo); the bot does not transmit a
 sudo password over the relay.
 
-Failover is automatic, but failback is intentionally manual. Before restarting
-the local primary after a server promotion, stop the active server bot and
-restart its standby service. Network partitions can still produce split-brain;
-strict fencing requires an independent lease/consensus service.
+Failover and failback are automatic. When local restarts, it writes a unique
+takeover request over SSH and waits. A promoted server cancels its active work,
+stops Telegram polling, writes the matching acknowledgment, and returns to
+standby. Only then does local start polling. If the VPS accepted the request but
+does not acknowledge within `FAILBACK_TIMEOUT`, local refuses to poll and exits
+instead of creating a token conflict.
+
+If SSH cannot reach the VPS at all, local starts so that a failed VPS does not
+also disable the primary. A network partition can therefore still produce
+split-brain; strict fencing requires an independent lease/consensus service.
 
 ---
 

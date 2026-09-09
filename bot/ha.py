@@ -26,6 +26,7 @@ def server_ssh_args() -> list[str]:
 
     args = [
         "ssh",
+        "-F", "/dev/null",
         "-T",
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=15",

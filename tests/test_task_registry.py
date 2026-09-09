@@ -118,6 +118,26 @@ class TaskRegistryTests(unittest.IsolatedAsyncioTestCase):
         task_b.cancel()
         await asyncio.gather(task_b, return_exceptions=True)
 
+    async def test_cancel_all_tasks_cancels_work_across_chats(self):
+        update_a = task_update(100)
+        update_b = task_update(200)
+        blocker = asyncio.Event()
+        task_a = asyncio.create_task(blocker.wait())
+        task_b = asyncio.create_task(blocker.wait())
+        task_registry.register_task(update_a, task_a, "Host command")
+        task_registry.register_task(update_b, task_b, "System monitor")
+
+        cancelled = task_registry.cancel_all_tasks()
+        await asyncio.gather(task_a, task_b, return_exceptions=True)
+
+        self.assertEqual(
+            {label for _task, label in cancelled},
+            {"Host command", "System monitor"},
+        )
+        self.assertTrue(task_a.cancelled())
+        self.assertTrue(task_b.cancelled())
+        self.assertEqual(task_registry._CHAT_TASKS, {})
+
 
 if __name__ == "__main__":
     unittest.main()

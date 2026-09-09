@@ -2,6 +2,9 @@ import asyncio
 from functools import wraps
 import logging
 import os
+from pathlib import Path
+import re
+import secrets
 import shlex
 import time
 
@@ -15,8 +18,11 @@ from telegram.ext import (
 
 from bot.config import (
     BOT_TOKEN,
+    FAILBACK_TIMEOUT,
     FAILOVER_TIMEOUT,
     HA_HEARTBEAT_FILE,
+    HA_TAKEOVER_ACK_FILE,
+    HA_TAKEOVER_REQUEST_FILE,
     HEARTBEAT_INTERVAL,
     INSTANCE_ROLE,
 )
@@ -32,7 +38,7 @@ from bot.utils import (
     split_pdf,
 )
 from bot.bot import execute_on_file
-from bot.task_registry import register_task
+from bot.task_registry import cancel_all_tasks, register_task
 
 
 logging.basicConfig(
@@ -40,6 +46,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+TAKEOVER_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _tracked_handler(callback, label):
@@ -172,50 +180,135 @@ async def _stop_application(application) -> None:
         await shutdown()
 
 
+async def _run_server_ssh(remote_command: str, timeout: float = 20):
+    """Run one internal SSH operation and return code/stdout/stderr."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *server_ssh_args(),
+            remote_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        return None, b"", str(exc).encode()
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
+    except TimeoutError:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        return None, b"", b"SSH command timed out"
+    return process.returncode, stdout, stderr
+
+
+async def _send_primary_heartbeat() -> bool:
+    remote_command = f"touch -- {shlex.quote(HA_HEARTBEAT_FILE)}"
+    return_code, _stdout, stderr = await _run_server_ssh(
+        remote_command,
+        timeout=min(HEARTBEAT_INTERVAL, 20),
+    )
+    if return_code == 0:
+        return True
+    detail = stderr.decode(errors="replace").strip()
+    logger.warning("Server heartbeat failed: %s", detail[-500:])
+    return False
+
+
 async def send_primary_heartbeats() -> None:
     """Touch a server-side lease file over SSH every configured interval."""
-    ssh_args = server_ssh_args()
-    remote_command = f"touch -- {shlex.quote(HA_HEARTBEAT_FILE)}"
     while True:
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *ssh_args,
-                remote_command,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=min(HEARTBEAT_INTERVAL, 20),
-                )
-            except asyncio.CancelledError:
-                if process.returncode is None:
-                    process.kill()
-                    await process.wait()
-                raise
-            except TimeoutError:
-                process.kill()
-                await process.wait()
-                logger.warning("Server heartbeat SSH command timed out")
-            else:
-                if process.returncode:
-                    detail = stderr.decode(errors="replace").strip()
-                    logger.warning(
-                        "Server heartbeat failed (exit %s): %s",
-                        process.returncode,
-                        detail[-500:],
-                    )
-        except OSError as exc:
-            logger.warning("Could not start heartbeat SSH command: %s", exc)
+        await _send_primary_heartbeat()
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
 
-async def run_main_bot(*, send_heartbeats: bool) -> None:
+def _read_takeover_request() -> str | None:
+    try:
+        path = Path(HA_TAKEOVER_REQUEST_FILE)
+        if path.stat().st_size > 128:
+            return None
+        nonce = path.read_text(encoding="ascii").strip()
+    except (FileNotFoundError, OSError, UnicodeError):
+        return None
+    return nonce if TAKEOVER_NONCE_RE.fullmatch(nonce) else None
+
+
+def _acknowledge_takeover(nonce: str) -> None:
+    """Atomically acknowledge only after this server has stopped polling."""
+    ack_path = Path(HA_TAKEOVER_ACK_FILE)
+    ack_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = ack_path.with_name(f".{ack_path.name}.{os.getpid()}.tmp")
+    temporary.write_text(f"{nonce}\n", encoding="ascii")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, ack_path)
+
+
+async def wait_for_takeover_request(ignored_nonce: str | None) -> str:
+    """Wait while active for a new local-primary takeover request."""
+    while True:
+        nonce = _read_takeover_request()
+        if nonce is not None and nonce != ignored_nonce:
+            return nonce
+        await asyncio.sleep(0.5)
+
+
+async def request_server_demotion() -> bool:
+    """Ask a reachable promoted server to stop before local starts polling."""
+    nonce = secrets.token_hex(16)
+    request_path = shlex.quote(HA_TAKEOVER_REQUEST_FILE)
+    temporary_path = shlex.quote(f"{HA_TAKEOVER_REQUEST_FILE}.{nonce}.tmp")
+    heartbeat_path = shlex.quote(HA_HEARTBEAT_FILE)
+    quoted_nonce = shlex.quote(nonce)
+    remote_command = (
+        "umask 077; "
+        f"printf '%s\\n' {quoted_nonce} > {temporary_path} && "
+        f"mv -- {temporary_path} {request_path} && "
+        f"touch -- {heartbeat_path}"
+    )
+    return_code, _stdout, stderr = await _run_server_ssh(remote_command)
+    if return_code != 0:
+        detail = stderr.decode(errors="replace").strip()
+        logger.critical(
+            "VPS is unreachable, so local will start without a demotion "
+            "acknowledgment (network partitions can cause split-brain): %s",
+            detail[-500:],
+        )
+        return False
+
+    ack_path = shlex.quote(HA_TAKEOVER_ACK_FILE)
+    read_ack = f"if [ -r {ack_path} ]; then cat -- {ack_path}; fi"
+    deadline = asyncio.get_running_loop().time() + FAILBACK_TIMEOUT
+    while asyncio.get_running_loop().time() < deadline:
+        return_code, stdout, _stderr = await _run_server_ssh(
+            read_ack,
+            timeout=min(10, FAILBACK_TIMEOUT),
+        )
+        if return_code == 0 and secrets.compare_digest(
+            stdout.decode(errors="replace").strip(),
+            nonce,
+        ):
+            logger.warning("Server acknowledged demotion; local is taking over")
+            return True
+        await asyncio.sleep(1)
+
+    raise RuntimeError(
+        "The VPS accepted the takeover request but did not acknowledge "
+        f"demotion within {FAILBACK_TIMEOUT:g} seconds; local will not poll "
+        "BOT_TOKEN to avoid a conflict"
+    )
+
+
+async def run_main_bot(*, send_heartbeats: bool, stop_signal=None):
     """Run the sole Telegram poller using BOT_TOKEN."""
     application = build_main_application()
     heartbeat_task = None
     initialized = False
+    stop_result = None
 
     try:
         await application.initialize()
@@ -229,21 +322,33 @@ async def run_main_bot(*, send_heartbeats: bool) -> None:
                 name="primary-heartbeat",
             )
         print(f"Bot is running on {INSTANCE_ROLE}...", flush=True)
-        await asyncio.Future()
+        if stop_signal is None:
+            await asyncio.Future()
+        else:
+            stop_result = await stop_signal
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
+        if stop_result is not None:
+            cancelled = cancel_all_tasks(exclude=asyncio.current_task())
+            if cancelled:
+                await asyncio.gather(
+                    *(task for task, _label in cancelled),
+                    return_exceptions=True,
+                )
         if initialized:
             await _stop_application(application)
         await close_mtproto_downloader()
+    return stop_result
 
 
-async def wait_for_primary_timeout() -> None:
+async def wait_for_primary_timeout() -> str | None:
     """Watch the local lease file without contacting the Telegram API."""
     loop = asyncio.get_running_loop()
     last_heartbeat = loop.time()
     last_mtime_ns = None
+    last_request = None
 
     print(
         f"Server standby is monitoring {HA_HEARTBEAT_FILE}; "
@@ -251,6 +356,12 @@ async def wait_for_primary_timeout() -> None:
         flush=True,
     )
     while True:
+        request = _read_takeover_request()
+        if request is not None and request != last_request:
+            # Standby is already demoted, so it can acknowledge immediately.
+            _acknowledge_takeover(request)
+            last_request = request
+
         try:
             stat = os.stat(HA_HEARTBEAT_FILE)
         except FileNotFoundError:
@@ -271,7 +382,7 @@ async def wait_for_primary_timeout() -> None:
                 "No primary heartbeat for %.1f seconds; promoting server",
                 FAILOVER_TIMEOUT,
             )
-            return
+            return last_request
         await asyncio.sleep(1)
 
 
@@ -285,6 +396,8 @@ def validate_config() -> None:
             "FAILOVER_TIMEOUT must be greater than the positive "
             "HEARTBEAT_INTERVAL"
         )
+    if FAILBACK_TIMEOUT <= 0:
+        raise RuntimeError("FAILBACK_TIMEOUT must be positive")
     if INSTANCE_ROLE == "local":
         # Resolve this at startup so a bad SSH configuration cannot silently
         # leave the server without heartbeats.
@@ -294,11 +407,35 @@ def validate_config() -> None:
 async def main():
     validate_config()
     if INSTANCE_ROLE == "server":
-        await wait_for_primary_timeout()
-        print("Primary lease expired; starting BOT_TOKEN on server...", flush=True)
-        await run_main_bot(send_heartbeats=False)
+        while True:
+            previous_request = await wait_for_primary_timeout()
+            print(
+                "Primary lease expired; starting BOT_TOKEN on server...",
+                flush=True,
+            )
+            takeover_task = asyncio.create_task(
+                wait_for_takeover_request(previous_request),
+                name="server-failback-watcher",
+            )
+            try:
+                nonce = await run_main_bot(
+                    send_heartbeats=False,
+                    stop_signal=takeover_task,
+                )
+            finally:
+                if not takeover_task.done():
+                    takeover_task.cancel()
+                await asyncio.gather(takeover_task, return_exceptions=True)
+            _acknowledge_takeover(nonce)
+            print(
+                "Local primary returned; server demoted to standby.",
+                flush=True,
+            )
+    elif INSTANCE_ROLE == "local":
+        await request_server_demotion()
+        await run_main_bot(send_heartbeats=True)
     else:
-        await run_main_bot(send_heartbeats=INSTANCE_ROLE == "local")
+        await run_main_bot(send_heartbeats=False)
 
 if __name__ == '__main__':
     try:

@@ -16,8 +16,17 @@ HA_HEARTBEAT_FILE = os.getenv(
     "HA_HEARTBEAT_FILE",
     "/tmp/sudobot-primary.heartbeat",
 )
+HA_TAKEOVER_REQUEST_FILE = os.getenv(
+    "HA_TAKEOVER_REQUEST_FILE",
+    f"{HA_HEARTBEAT_FILE}.takeover",
+)
+HA_TAKEOVER_ACK_FILE = os.getenv(
+    "HA_TAKEOVER_ACK_FILE",
+    f"{HA_HEARTBEAT_FILE}.takeover.ack",
+)
 HEARTBEAT_INTERVAL = float(os.getenv("HEARTBEAT_INTERVAL", "30"))
 FAILOVER_TIMEOUT = float(os.getenv("FAILOVER_TIMEOUT", "90"))
+FAILBACK_TIMEOUT = float(os.getenv("FAILBACK_TIMEOUT", "30"))
 MAX_CHARS = os.getenv("MAX_CHARS", "4096")  # Default to "False" if not set
 SUPER_ADMIN_USERNAME = os.getenv(
     "SUPER_ADMIN_USERNAME",

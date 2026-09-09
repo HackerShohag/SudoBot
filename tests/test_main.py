@@ -62,6 +62,7 @@ class MainTests(unittest.IsolatedAsyncioTestCase):
                 "close_mtproto_downloader",
                 new_callable=AsyncMock,
             ) as close_mtproto,
+            patch.object(main_module, "INSTANCE_ROLE", "standalone"),
             patch.object(main_module.asyncio, "Future", return_value=completed),
         ):
             await main_module.main()

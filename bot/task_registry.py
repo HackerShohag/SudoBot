@@ -89,6 +89,29 @@ def cancel_chat_tasks(update, *, exclude=None):
     return cancelled
 
 
+def cancel_all_tasks(*, exclude=None):
+    """Cancel all tracked work, used when an HA active node demotes."""
+    excluded = (
+        set(exclude)
+        if isinstance(exclude, (set, frozenset, list, tuple))
+        else {exclude}
+    )
+    cancelled = []
+    for key, tasks in list(_CHAT_TASKS.items()):
+        for task, entry in list(tasks.items()):
+            if task in excluded or entry.cancel_requested:
+                continue
+            if task.done():
+                _forget_task(key, task)
+                continue
+            entry.cancel_requested = True
+            if task.cancel():
+                cancelled.append((task, entry.label))
+            else:
+                _forget_task(key, task)
+    return cancelled
+
+
 def tracked_tasks(update):
     """Return a snapshot for status reporting and tests."""
     return {
