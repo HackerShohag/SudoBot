@@ -35,10 +35,17 @@ class FailbackTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ack.stat().st_mode & 0o777, 0o600)
 
     async def test_active_server_detects_a_new_takeover_request(self):
-        with patch.object(
-            main_module,
-            "_read_takeover_request",
-            return_value=NONCE,
+        with (
+            patch.object(
+                main_module,
+                "_read_takeover_request",
+                return_value=NONCE,
+            ),
+            patch.object(
+                main_module,
+                "_fresh_heartbeat_revision",
+                return_value=None,
+            ),
         ):
             result = await asyncio.wait_for(
                 main_module.wait_for_takeover_request(None),
@@ -46,6 +53,26 @@ class FailbackTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, NONCE)
+
+    async def test_active_server_demotes_when_heartbeats_resume(self):
+        with (
+            patch.object(
+                main_module,
+                "_read_takeover_request",
+                return_value=None,
+            ),
+            patch.object(
+                main_module,
+                "_fresh_heartbeat_revision",
+                side_effect=[100, 101],
+            ),
+        ):
+            result = await asyncio.wait_for(
+                main_module.wait_for_takeover_request(None),
+                timeout=0.1,
+            )
+
+        self.assertIsNone(result)
 
     async def test_local_waits_for_matching_server_acknowledgment(self):
         ssh = AsyncMock(

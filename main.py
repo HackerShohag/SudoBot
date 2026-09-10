@@ -248,12 +248,44 @@ def _acknowledge_takeover(nonce: str) -> None:
     os.replace(temporary, ack_path)
 
 
-async def wait_for_takeover_request(ignored_nonce: str | None) -> str:
-    """Wait while active for a new local-primary takeover request."""
+def _fresh_heartbeat_revision() -> int | None:
+    """Return the revision of a current primary lease, if one exists."""
+    try:
+        stat = os.stat(HA_HEARTBEAT_FILE)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.warning("Could not inspect heartbeat file: %s", exc)
+        return None
+
+    age = time.time() - stat.st_mtime
+    if -5 <= age <= FAILOVER_TIMEOUT:
+        return stat.st_mtime_ns
+    return None
+
+
+async def wait_for_takeover_request(
+    ignored_nonce: str | None,
+) -> str | None:
+    """Wait while active for a takeover request or a resumed heartbeat."""
+    heartbeat_revision = _fresh_heartbeat_revision()
     while True:
         nonce = _read_takeover_request()
         if nonce is not None and nonce != ignored_nonce:
             return nonce
+
+        current_revision = _fresh_heartbeat_revision()
+        if (
+            current_revision is not None
+            and current_revision != heartbeat_revision
+        ):
+            # The local instance can remain alive through a temporary SSH
+            # outage. Once its lease updates resume, local has priority and
+            # the promoted server must immediately stop polling Telegram.
+            logger.warning(
+                "Primary heartbeat resumed; demoting active server"
+            )
+            return None
         await asyncio.sleep(0.5)
 
 
@@ -309,6 +341,7 @@ async def run_main_bot(*, send_heartbeats: bool, stop_signal=None):
     heartbeat_task = None
     initialized = False
     stop_result = None
+    stopped_by_signal = False
 
     try:
         await application.initialize()
@@ -326,11 +359,12 @@ async def run_main_bot(*, send_heartbeats: bool, stop_signal=None):
             await asyncio.Future()
         else:
             stop_result = await stop_signal
+            stopped_by_signal = True
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
-        if stop_result is not None:
+        if stopped_by_signal:
             cancelled = cancel_all_tasks(exclude=asyncio.current_task())
             if cancelled:
                 await asyncio.gather(
@@ -362,20 +396,16 @@ async def wait_for_primary_timeout() -> str | None:
             _acknowledge_takeover(request)
             last_request = request
 
-        try:
-            stat = os.stat(HA_HEARTBEAT_FILE)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            logger.warning("Could not inspect heartbeat file: %s", exc)
-        else:
-            # Only accept a newly touched, reasonably current file. This keeps
-            # a stale lease left by an old primary from extending startup.
-            age = time.time() - stat.st_mtime
-            if stat.st_mtime_ns != last_mtime_ns and -5 <= age <= FAILOVER_TIMEOUT:
-                last_mtime_ns = stat.st_mtime_ns
-                last_heartbeat = loop.time()
-                logger.info("Primary heartbeat observed")
+        # Only accept a newly touched, reasonably current file. This keeps a
+        # stale lease left by an old primary from extending startup.
+        heartbeat_revision = _fresh_heartbeat_revision()
+        if (
+            heartbeat_revision is not None
+            and heartbeat_revision != last_mtime_ns
+        ):
+            last_mtime_ns = heartbeat_revision
+            last_heartbeat = loop.time()
+            logger.info("Primary heartbeat observed")
 
         if loop.time() - last_heartbeat >= FAILOVER_TIMEOUT:
             logger.critical(
@@ -426,7 +456,8 @@ async def main():
                 if not takeover_task.done():
                     takeover_task.cancel()
                 await asyncio.gather(takeover_task, return_exceptions=True)
-            _acknowledge_takeover(nonce)
+            if nonce is not None:
+                _acknowledge_takeover(nonce)
             print(
                 "Local primary returned; server demoted to standby.",
                 flush=True,
