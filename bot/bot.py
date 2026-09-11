@@ -18,6 +18,7 @@ from bot.task_registry import (
     register_task,
     unregister_task,
 )
+from bot.status_animation import STATUS_FRAMES
 import signal
 import os
 
@@ -32,7 +33,6 @@ logger = logging.getLogger(__name__)
 TELEGRAM_SAFE_MESSAGE_LIMIT = 4000
 STATUS_EDIT_INTERVAL = 4.0
 OUTPUT_TAIL_CHARS = 32_768
-SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 SENSITIVE_PATH_RE = re.compile(
     r"(?i)(?<![a-z0-9_])(?:\.env(?:\.[a-z0-9_-]+)?|"
@@ -320,7 +320,7 @@ def _running_text(active: _ActiveCommand, elapsed: float, frame: int) -> str:
         title = f"🛑 Stopping {subject}…"
     else:
         title = (
-            f"{SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]} "
+            f"{STATUS_FRAMES[frame % len(STATUS_FRAMES)]} "
             f"Running {subject}…"
         )
     header = f"{title}\nElapsed: {_format_elapsed(elapsed)}"

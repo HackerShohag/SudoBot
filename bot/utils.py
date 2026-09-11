@@ -30,6 +30,11 @@ from bot.mtproto import (
     MtprotoError,
 )
 from bot.task_registry import register_task, unregister_task
+from bot.status_animation import (
+    animate_status,
+    animated_status_text,
+    stop_animation,
+)
 
 UPLOAD_DIR = "uploads"
 DB_PATH = "db/authorized_users.db"
@@ -299,7 +304,15 @@ def _human_file_size(size):
 def _download_status_text(document):
     size = _human_file_size(getattr(document, "file_size", None))
     size_text = f" ({size})" if size else ""
-    return f"⬇️ Downloading selected PDF{size_text}…"
+    return animated_status_text(f"Downloading selected PDF{size_text}…")
+
+
+async def _animate_pdf_status(status, text):
+    """Animate a PDF phase that has no measurable byte/page progress."""
+    await animate_status(
+        text,
+        lambda rendered: status.update(rendered, force=True),
+    )
 
 
 def _requires_mtproto_download(document):
@@ -1259,7 +1272,9 @@ async def _download_pdf_document(
             size = _human_file_size(getattr(document, "file_size", None))
             size_text = f" ({size})" if size else ""
             await status.update(
-                f"⬇️ Preparing direct Telegram download{size_text}…",
+                animated_status_text(
+                    f"Preparing direct Telegram download{size_text}…"
+                ),
                 force=True,
             )
 
@@ -1298,7 +1313,20 @@ async def _download_pdf_document(
         if _requires_mtproto_download(document):
             await download_with_mtproto()
         else:
+            animation = None
             try:
+                if status is not None:
+                    size = _human_file_size(
+                        getattr(document, "file_size", None)
+                    )
+                    size_text = f" ({size})" if size else ""
+                    animation = asyncio.create_task(
+                        _animate_pdf_status(
+                            status,
+                            f"Downloading selected PDF{size_text}…",
+                        ),
+                        name="pdf-download-animation",
+                    )
                 telegram_file = await context.bot.get_file(document.file_id)
                 await telegram_file.download_to_drive(str(download_path))
             except TelegramError as exc:
@@ -1308,7 +1336,11 @@ async def _download_pdf_document(
                     download_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+                await stop_animation(animation)
+                animation = None
                 await download_with_mtproto()
+            finally:
+                await stop_animation(animation)
         if download_path != file_path:
             download_path.replace(file_path)
     except asyncio.CancelledError:
@@ -1451,9 +1483,15 @@ def _pdf_upload_status_text(
     if completed:
         heading = f"✅ Uploaded {label}."
     elif total and transferred >= total:
-        heading = f"⬆️ Finishing {label} with Telegram…"
+        heading = animated_status_text(
+            f"Finishing {label} with Telegram…",
+            int(elapsed / PDF_UPLOAD_STATUS_INTERVAL),
+        )
     else:
-        heading = f"⬆️ Uploading {label}…"
+        heading = animated_status_text(
+            f"Uploading {label}…",
+            int(elapsed / PDF_UPLOAD_STATUS_INTERVAL),
+        )
 
     progress = (
         f"{_human_file_size(transferred)} / {_human_file_size(total)} "
@@ -1742,8 +1780,11 @@ async def _split_pdf_with_progress(
                     _, processed, total = event
                     percent = round((processed / total) * 100) if total else 0
                     await status.update(
-                        f"⚙️ Splitting PDF: {processed}/{total} pages "
-                        f"({percent}%)…"
+                        animated_status_text(
+                            f"Splitting PDF: {processed}/{total} pages "
+                            f"({percent}%)…",
+                            processed,
+                        )
                     )
 
             if not worker.is_alive():
@@ -1964,17 +2005,31 @@ async def _split_pdf_result(
                 status = await _new_pdf_status(
                     update.message,
                     context,
-                    "🔎 Locating PDFs in the selected album…",
+                    animated_status_text(
+                        "Locating PDFs in the selected album…"
+                    ),
                     reply_to_message_id=source_reply_id,
                 )
                 _set_pdf_job_status(update, status)
+            animation = asyncio.create_task(
+                _animate_pdf_status(
+                    status,
+                    "Locating PDFs in the selected album…",
+                ),
+                name="pdf-album-discovery-animation",
+            )
+            discovery_error = None
             try:
                 selection = await _resolve_replied_media_group_sources(
                     update,
                     context,
                 )
             except PdfDownloadError as exc:
-                await status.update(str(exc), force=True)
+                discovery_error = exc
+            finally:
+                await stop_animation(animation)
+            if discovery_error is not None:
+                await status.update(str(discovery_error), force=True)
                 return False
             return await _split_replied_media_group(
                 update,
@@ -1988,7 +2043,7 @@ async def _split_pdf_result(
         status = await _new_pdf_status(
             update.message,
             context,
-            "🔎 Locating the selected PDF…",
+            animated_status_text("Locating the selected PDF…"),
         )
         _set_pdf_job_status(update, status)
 
@@ -2016,7 +2071,9 @@ async def _split_pdf_result(
         )
     if input_path is None and explicit_reply:
         await status.update(
-            "⬇️ Recovering and downloading the selected group PDF…",
+            animated_status_text(
+                "Recovering and downloading the selected group PDF…"
+            ),
             force=True,
         )
         try:
@@ -2050,7 +2107,9 @@ async def _split_pdf_result(
         return False
 
     await status.update(
-        f"⚙️ Splitting PDF in {'duplex' if duplex else 'simplex'} mode…",
+        animated_status_text(
+            f"Splitting PDF in {'duplex' if duplex else 'simplex'} mode…"
+        ),
         force=True,
     )
 

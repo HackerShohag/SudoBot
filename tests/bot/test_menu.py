@@ -162,7 +162,7 @@ class TestMenu(unittest.IsolatedAsyncioTestCase):
 
         to_thread.assert_awaited_once_with(menu._collect_machine_specs)
         update.message.reply_text.assert_awaited_once_with(
-            "⏳ Collecting machine specifications..."
+            menu.animated_status_text("Collecting machine specifications…")
         )
         status.edit_text.assert_awaited_once_with(expected)
 
@@ -211,7 +211,9 @@ class TestMenu(unittest.IsolatedAsyncioTestCase):
             await menu.monitor_system_usage(update, context)
 
         update.message.reply_text.assert_awaited_once_with(
-            "🟢 Starting system monitor — gathering the first reading..."
+            menu.animated_status_text(
+                "Starting system monitor — gathering the first reading…"
+            )
         )
         context.application.create_task.assert_called_once()
         monitor_coroutine = context.application.create_task.call_args.args[0]
@@ -375,7 +377,7 @@ class TestMenu(unittest.IsolatedAsyncioTestCase):
         monitoring_times = [
             timestamp
             for timestamp, text in zip(edit_times, rendered)
-            if text.startswith("🟢 Monitoring")
+            if "Monitoring system usage" in text
         ]
         self.assertEqual(len(monitoring_times), 3)
         self.assertAlmostEqual(monitoring_times[0], 0.2)

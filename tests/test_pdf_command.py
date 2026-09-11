@@ -1151,7 +1151,9 @@ class PdfAlbumWorkflowTests(unittest.IsolatedAsyncioTestCase):
         first_reply = command.reply_text.await_args_list[0]
         self.assertEqual(
             first_reply.args[0],
-            "🔎 Locating PDFs in the selected album…",
+            pdf_utils.animated_status_text(
+                "Locating PDFs in the selected album…"
+            ),
         )
         self.assertEqual(first_reply.kwargs["reply_to_message_id"], 11)
         self.assertTrue(first_reply.kwargs["allow_sending_without_reply"])
@@ -1487,7 +1489,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         message.reply_text.assert_awaited_once_with(
-            "🔎 Locating the selected PDF…"
+            pdf_utils.animated_status_text("Locating the selected PDF…")
         )
         prompt = prompt_message.edit_text.await_args.args[0]
         self.assertIn("Reply directly to this bot message", prompt)
@@ -1590,7 +1592,7 @@ class PendingPdfWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("pending_pdf_split", context.chat_data)
         message.reply_text.assert_awaited_once_with(
-            "🔎 Locating the selected PDF…"
+            pdf_utils.animated_status_text("Locating the selected PDF…")
         )
         prompt = prompt_message.edit_text.await_args.args[0]
         self.assertIn("No downloadable PDF was selected", prompt)

@@ -17,6 +17,12 @@ from bot.task_registry import (
     register_task,
     unregister_task,
 )
+from bot.status_animation import (
+    STATUS_FRAMES,
+    animate_status,
+    animated_status_text,
+    stop_animation,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -276,30 +282,47 @@ async def _run_status_command(
 
     task = register_current_task(update, label)
     status = None
+    animation = None
     try:
-        status = await update.message.reply_text(initial_text)
+        status = await update.message.reply_text(
+            animated_status_text(initial_text)
+        )
+        animation = asyncio.create_task(
+            animate_status(
+                initial_text,
+                lambda text: _edit_message_with_retry(status, text),
+            ),
+            name=f"status-animation:{label.casefold().replace(' ', '-')}",
+        )
         response = await asyncio.to_thread(collector)
+        await stop_animation(animation)
+        animation = None
         await _edit_message_with_retry(status, render(response))
     except asyncio.CancelledError:
+        await asyncio.shield(stop_animation(animation))
+        animation = None
         if status is not None:
             await asyncio.shield(
                 _edit_message_with_retry(status, f"🛑 {label} stopped.")
             )
         raise
     except Exception as exc:
+        await stop_animation(animation)
+        animation = None
         if status is not None:
             await _edit_message_with_retry(
                 status,
                 f"{error_label}: {exc}",
             )
     finally:
+        await stop_animation(animation)
         unregister_task(update, task)
 
 
 async def get_local_ip(update: Update, context) -> None:
     await _run_status_command(
         update,
-        "⏳ Looking up the local IP...",
+        "Looking up the local IP…",
         _find_local_ip,
         label="Local IP lookup",
         error_label="Error retrieving local IP",
@@ -310,7 +333,7 @@ async def get_local_ip(update: Update, context) -> None:
 async def get_system_info(update: Update, context) -> None:
     await _run_status_command(
         update,
-        "⏳ Collecting system information...",
+        "Collecting system information…",
         _collect_system_information,
         label="System information",
         error_label="Error retrieving system info",
@@ -320,7 +343,7 @@ async def get_system_info(update: Update, context) -> None:
 async def get_disk_usage(update: Update, context) -> None:
     await _run_status_command(
         update,
-        "⏳ Checking disk usage...",
+        "Checking disk usage…",
         _collect_disk_usage,
         label="Disk usage check",
         error_label="Error retrieving disk usage",
@@ -330,7 +353,7 @@ async def get_disk_usage(update: Update, context) -> None:
 async def get_public_ip(update: Update, context) -> None:
     await _run_status_command(
         update,
-        "⏳ Looking up the public IP...",
+        "Looking up the public IP…",
         _fetch_public_ip,
         label="Public IP lookup",
         error_label="Error retrieving public IP",
@@ -341,7 +364,7 @@ async def get_public_ip(update: Update, context) -> None:
 async def get_system_usage(update: Update, context) -> None:
     await _run_status_command(
         update,
-        "⏳ Measuring system usage...",
+        "Measuring system usage…",
         _collect_system_usage,
         label="System usage check",
         error_label="Error retrieving system usage",
@@ -351,7 +374,7 @@ async def get_system_usage(update: Update, context) -> None:
 async def get_machine_specs(update: Update, context) -> None:
     await _run_status_command(
         update,
-        "⏳ Collecting machine specifications...",
+        "Collecting machine specifications…",
         _collect_machine_specs,
         label="Machine specifications",
         error_label="Error retrieving machine specs",
@@ -362,6 +385,7 @@ async def _run_usage_monitor(message):
     loop = asyncio.get_running_loop()
     end_time = loop.time() + MONITOR_DURATION_SECONDS
     next_tick = loop.time()
+    frame = 0
 
     try:
         while loop.time() < end_time:
@@ -369,10 +393,12 @@ async def _run_usage_monitor(message):
             time_left = max(0, int(end_time - loop.time()))
             minutes, seconds = divmod(time_left, 60)
             response = (
-                f"🟢 Monitoring system usage — {minutes:02d}:{seconds:02d} remaining\n"
+                f"{STATUS_FRAMES[frame % len(STATUS_FRAMES)]} "
+                f"Monitoring system usage — {minutes:02d}:{seconds:02d} remaining\n"
                 f"{usage}"
             )
             await _edit_message_with_retry(message, response)
+            frame += 1
 
             next_tick += MONITOR_INTERVAL_SECONDS
             now = loop.time()
@@ -430,7 +456,9 @@ async def monitor_system_usage(
 
     startup_task = asyncio.create_task(
         update.message.reply_text(
-            "🟢 Starting system monitor — gathering the first reading..."
+            animated_status_text(
+                "Starting system monitor — gathering the first reading…"
+            )
         )
     )
     try:
