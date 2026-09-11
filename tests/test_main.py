@@ -142,6 +142,7 @@ class MainTests(unittest.IsolatedAsyncioTestCase):
             for command in handler.commands
         }
         expected_tracked_callbacks = {
+            "get": main_module.tracked_get_file,
             "splitpdf": main_module.tracked_split_pdf,
             "printer": main_module.tracked_split_pdf,
             "get_local_ip": main_module.tracked_local_ip,

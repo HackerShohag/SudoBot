@@ -71,13 +71,78 @@ class HostCommandSecurityTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("bot.bot.is_super_admin", return_value=False),
+            patch("bot.bot.is_admin", return_value=False),
             patch("bot.bot._launch_command", new_callable=AsyncMock) as launch,
         ):
             await run_command(update, context)
 
         launch.assert_not_awaited()
         update.message.reply_text.assert_awaited_once_with(
-            "❌ Only the super admin can run host commands."
+            "❌ Only authorized admins can run host commands."
+        )
+
+    async def test_admin_cannot_use_run_to_list_hidden_files(self):
+        for command in (
+            "ls -la",
+            "ls .env",
+            "ls --all",
+            "find . -name '.*'",
+            "cat .gitignore",
+            "python -c 'print(1)'",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNotNone(
+                    command_bot._admin_command_security_error(command)
+                )
+
+    async def test_admin_can_run_a_safe_read_only_command(self):
+        update = command_update("admin_user")
+        context = SimpleNamespace(
+            args=["df", "-h"],
+            user_data={},
+            chat_data={},
+        )
+
+        with (
+            patch("bot.bot.is_super_admin", return_value=False),
+            patch("bot.bot.is_admin", return_value=True),
+            patch("bot.bot._launch_command", new_callable=AsyncMock) as launch,
+        ):
+            await run_command(update, context)
+
+        launch.assert_awaited_once_with(
+            "df -h",
+            update,
+            context,
+            10,
+            allow_admin=True,
+            policy_command="df -h",
+        )
+
+    async def test_internal_launcher_blocks_unsafe_admin_command(self):
+        update = command_update("admin_user")
+        context = SimpleNamespace(
+            application=SimpleNamespace(create_task=MagicMock())
+        )
+
+        with (
+            patch("bot.bot.is_super_admin", return_value=False),
+            patch("bot.bot.is_admin", return_value=True),
+        ):
+            launched = await command_bot._launch_command(
+                "cat README.md",
+                update,
+                context,
+                10,
+                allow_admin=True,
+            )
+
+        self.assertFalse(launched)
+        context.application.create_task.assert_not_called()
+        update.message.reply_text.assert_awaited_once()
+        self.assertIn(
+            "Admin command blocked",
+            update.message.reply_text.await_args.args[0],
         )
 
     async def test_checkpoint_blocks_environment_file_access(self):

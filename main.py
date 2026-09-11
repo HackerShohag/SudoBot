@@ -38,6 +38,7 @@ from bot.utils import (
     split_pdf,
 )
 from bot.bot import execute_on_file
+from bot.file_delivery import get_file
 from bot.task_registry import cancel_all_tasks, register_task
 
 
@@ -77,6 +78,7 @@ tracked_system_info = _tracked_handler(menu.get_system_info, "system information
 tracked_machine_specs = _tracked_handler(menu.get_machine_specs, "machine specifications")
 tracked_system_usage = _tracked_handler(menu.get_system_usage, "system usage")
 tracked_disk_usage = _tracked_handler(menu.get_disk_usage, "disk usage")
+tracked_get_file = _tracked_handler(get_file, "file upload")
 tracked_system_monitor = _tracked_handler(
     menu.monitor_system_usage,
     "system monitor startup",
@@ -135,6 +137,7 @@ def build_main_application():
     application.add_handler(CommandHandler("splitpdf", tracked_split_pdf))
     application.add_handler(CommandHandler("printer", tracked_split_pdf))
     application.add_handler(CommandHandler("runfile", execute_on_file))
+    application.add_handler(CommandHandler("get", tracked_get_file))
     application.add_handler(
         CommandHandler("get_local_ip", tracked_local_ip)
     )

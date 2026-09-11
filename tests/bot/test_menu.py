@@ -149,6 +149,7 @@ class TestMenu(unittest.IsolatedAsyncioTestCase):
         }
         self.assertIn("authorize", commands)
         self.assertIn("unauthorize", commands)
+        self.assertIn("get", commands)
 
     async def test_machine_specs_edits_one_progress_message(self):
         update, status = make_update()

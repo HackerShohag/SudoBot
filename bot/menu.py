@@ -253,6 +253,7 @@ async def set_bot_menu(application):
     commands = [
         BotCommand("run", "Run a command"),
         BotCommand("stop", "Stop all running work in this chat"),
+        BotCommand("get", "Upload a file to this chat (admins)"),
         BotCommand("splitpdf", "Split PDFs or a replied PDF album"),
         BotCommand("authorize", "Authorize a user (admins)"),
         BotCommand("unauthorize", "Revoke user access (admins)"),

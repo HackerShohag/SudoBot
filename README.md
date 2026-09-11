@@ -3,10 +3,13 @@
 SudoBot is a powerful **Telegram Bot** that allows users to execute commands, retrieve system information, check IP details, and manage system processes—all from Telegram.
 
 ## 🚀 Features
-- ✅ **Command Execution:** Run shell commands remotely as the configured super admin.
+- ✅ **Command Execution:** Admins can run a constrained read-only command
+  profile; the configured super admin retains full host-command access.
 - ⚡ **Parallel Commands:** Run multiple host commands concurrently in one chat,
   each with its own live status message.
 - ⏱️ **Live Command Status:** Follow elapsed time and streamed output in one edited message.
+- 📄 **Controlled File Retrieval:** Admins can upload permitted project files
+  to Telegram with `/get`, with stricter credential and path controls.
 - 🛑 **Chat-wide Stop:** `/stop` interrupts all work running in that chat,
   including shell commands, PDF processing, monitors, and system/IP lookups.
 - 🌍 **IP Information:** Fetch local and public IP addresses.
@@ -161,7 +164,7 @@ SUPER_ADMIN_USERNAME=your_telegram_username
   for recovering complete PDF albums after a restart or a metadata cache miss.
 - Set `SUPER_ADMIN_USERNAME` to your Telegram username without `@`. This
   explicitly configured account can bootstrap authorization on a fresh
-  install and is the only account allowed to run host commands.
+  install and is the only account allowed unrestricted host commands.
 
 ### Single-token high availability
 
@@ -205,6 +208,29 @@ Host commands use this mapping:
 /run <command>            run on the currently active machine
 /run --server <command>   run on the server
 ```
+
+File retrieval uses:
+
+```text
+/get filename
+/get relative/path/to/file
+/get /absolute/path/to/file
+```
+
+The configured super admin may retrieve any regular file readable by the bot's
+operating-system account. Other authorized admins are confined to the bot
+project directory. They may retrieve ordinary hidden files such as
+`.gitignore`, but not `.env` variants, private keys, credential files, paths
+inside `.ssh`/`.gnupg`, symlink escapes, directories, system paths, or files
+larger than 49 MB.
+
+Authorized admins may use `/run` only with a constrained, read-only profile:
+`date`, `df`, `free`, `hostname`, safe `ip` inspection, `ls`, `lsblk`, `lscpu`,
+`nproc`, `pwd`, `uname`, `uptime`, and `whoami`. Shell operators, expansion,
+wildcards, interpreters, arbitrary file readers, mutating IP actions, paths
+outside the project, and hidden-file listing flags are rejected. `/runfile`
+remains super-admin-only. The environment-secret checkpoint remains active
+even for unrestricted commands.
 
 While the local primary is active, `--server` uses SSH and feeds the remote
 stdout/stderr into the existing live Telegram status. After server takeover,

@@ -18,7 +18,10 @@ STATUS_FRAMES = (
     "⠇",
     "⠏",
 )
-STATUS_ANIMATION_INTERVAL = 3.0
+# Two seconds is visibly fluid while remaining conservative enough for
+# Telegram's per-chat edit throttling. RetryAfter is still handled by each
+# caller's existing safe-edit wrapper.
+STATUS_ANIMATION_INTERVAL = 2.0
 
 
 def animated_status_text(text: str, frame: int = 0) -> str:

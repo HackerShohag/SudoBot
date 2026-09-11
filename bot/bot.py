@@ -4,12 +4,13 @@ import html
 import logging
 import re
 import shlex
+from pathlib import Path
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes, ConversationHandler, CallbackContext
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 from bot.keyboard import update_command_history, update_keyboard
-from bot.utils import is_super_admin
+from bot.utils import is_admin, is_super_admin
 from bot.config import INSTANCE_ROLE, MAX_CHARS
 from bot.ha import server_command
 from bot.task_registry import (
@@ -28,10 +29,10 @@ UPLOAD_DIR = "uploads"
 logger = logging.getLogger(__name__)
 
 # Telegram permits at most 4,096 characters in a text message.  Keep a small
-# character-count safety margin. Four seconds is frequent enough to make a
-# command feel alive without approaching Telegram's per-chat edit limits.
+# character-count safety margin. Two seconds makes command activity clearly
+# visible; RetryAfter handling backs off whenever Telegram asks us to.
 TELEGRAM_SAFE_MESSAGE_LIMIT = 4000
-STATUS_EDIT_INTERVAL = 4.0
+STATUS_EDIT_INTERVAL = 2.0
 OUTPUT_TAIL_CHARS = 32_768
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 SENSITIVE_PATH_RE = re.compile(
@@ -62,6 +63,23 @@ COMMAND_ENV_ALLOWLIST = {
     "USER",
     "XDG_RUNTIME_DIR",
 }
+ADMIN_SAFE_COMMANDS = {
+    "date",
+    "df",
+    "free",
+    "hostname",
+    "ip",
+    "ls",
+    "lsblk",
+    "lscpu",
+    "nproc",
+    "pwd",
+    "uname",
+    "uptime",
+    "whoami",
+}
+COMMAND_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SHELL_CONTROL_RE = re.compile(r"[;&|<>`$(){}\[\]*?\n\r]")
 
 
 def _command_security_error(command: str) -> str | None:
@@ -72,6 +90,85 @@ def _command_security_error(command: str) -> str | None:
         return "expansion of sensitive environment variables is not allowed"
     if ENVIRONMENT_DUMP_RE.search(command):
         return "dumping the process environment is not allowed"
+    return None
+
+
+def _admin_command_security_error(command: str) -> str | None:
+    """Restrict admins to bounded, read-only commands without shell syntax."""
+    secret_error = _command_security_error(command)
+    if secret_error is not None:
+        return secret_error
+    if SHELL_CONTROL_RE.search(command):
+        return "shell operators, expansion, and wildcard syntax are not allowed"
+    try:
+        arguments = shlex.split(command)
+    except ValueError:
+        return "the command syntax is invalid"
+    if not arguments or arguments[0] not in ADMIN_SAFE_COMMANDS:
+        allowed = ", ".join(sorted(ADMIN_SAFE_COMMANDS))
+        return f"admins may use only these read-only commands: {allowed}"
+
+    if arguments[0] == "ip" and (
+        len(arguments) < 2
+        or arguments[1] not in {"address", "addr", "link", "route"}
+    ):
+        return "admins may use only ip address, ip link, or ip route"
+    if arguments[0] == "ip":
+        allowed_actions = (
+            {"show", "list"}
+            if arguments[1] != "route"
+            else {"show", "list", "get"}
+        )
+        if len(arguments) > 2 and arguments[2] not in allowed_actions:
+            return "admins may inspect IP configuration but cannot change it"
+
+    allowed_exact_arguments = {
+        "date": {()},
+        "df": {(), ("-h",), ("-H",), ("-hT",), ("-Th",)},
+        "free": {(), ("-h",), ("-m",), ("-g",), ("-t",)},
+        "hostname": {(), ("-I",), ("-f",), ("-s",)},
+        "lsblk": {(), ("-f",), ("-p",)},
+        "lscpu": {()},
+        "nproc": {(), ("--all",)},
+        "pwd": {(), ("-L",), ("-P",)},
+        "uname": {(), ("-a",), ("-m",), ("-n",), ("-r",)},
+        "uptime": {(), ("-p",), ("-s",)},
+        "whoami": {()},
+    }
+    if arguments[0] in allowed_exact_arguments and tuple(arguments[1:]) not in (
+        allowed_exact_arguments[arguments[0]]
+    ):
+        return f"those {arguments[0]} arguments are not available to admins"
+
+    if arguments[0] == "ls":
+        for argument in arguments[1:]:
+            if argument.startswith("-"):
+                if argument in {"--all", "--almost-all"}:
+                    return "listing hidden files through /run is not allowed"
+                if argument.startswith("--"):
+                    if argument not in {"--color", "--color=auto", "--color=never"}:
+                        return "that ls option is not available to admins"
+                elif not set(argument[1:]) <= set("1CxFrtSh"):
+                    return "that ls option is not available to admins"
+                continue
+            candidate = Path(argument)
+            if any(
+                part.startswith(".") and part not in {".", ".."}
+                for part in candidate.parts
+            ):
+                return "listing hidden files through /run is not allowed"
+            if ".." in candidate.parts:
+                return "parent-directory traversal is not allowed"
+            if candidate.is_absolute():
+                return "admins may list only paths inside the bot project"
+            resolved = (COMMAND_PROJECT_ROOT / candidate).resolve()
+            try:
+                relative = resolved.relative_to(COMMAND_PROJECT_ROOT)
+            except ValueError:
+                return "admins may list only paths inside the bot project"
+            if any(part.startswith(".") for part in relative.parts):
+                return "listing hidden files through /run is not allowed"
+
     return None
 
 
@@ -596,15 +693,27 @@ async def _launch_command(
     reply_to_message_id,
     *,
     subject: str = "Command",
+    allow_admin: bool = False,
+    policy_command: str | None = None,
 ) -> bool:
     """Reserve and detach command work from Telegram dispatch."""
-    if not is_super_admin(update.message.from_user):
-        await update.message.reply_text(
-            "❌ Only the super admin can run host commands."
-        )
-        return False
-    if await _reject_unsafe_command(update, command, reply_to_message_id):
-        return False
+    user = update.message.from_user
+    if is_super_admin(user):
+        if await _reject_unsafe_command(update, command, reply_to_message_id):
+            return False
+    else:
+        if not allow_admin or not is_admin(user):
+            await update.message.reply_text(
+                "❌ Only authorized admins can run this command."
+            )
+            return False
+        reason = _admin_command_security_error(policy_command or command)
+        if reason is not None:
+            await update.message.reply_text(
+                f"🛡️ Admin command blocked: {reason}.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return False
 
     chat_key = _command_chat_key(update)
     # Reserve before the first await/task switch. This makes an immediately
@@ -711,9 +820,11 @@ async def execute_on_file(update: Update, context: CallbackContext) -> None:
     )
 
 async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_super_admin(update.message.from_user):
+    user = update.message.from_user
+    super_admin = is_super_admin(user)
+    if not super_admin and not is_admin(user):
         await update.message.reply_text(
-            "❌ Only the super admin can run host commands."
+            "❌ Only authorized admins can run host commands."
         )
         return
 
@@ -722,6 +833,12 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if run_on_server:
         arguments.pop(0)
     command = " ".join(arguments)
+    policy_command = command
+    admin_options = (
+        {"allow_admin": True, "policy_command": policy_command}
+        if not super_admin
+        else {}
+    )
 
     if not command:
         # TODO: autofill the input field with the /run command so the user can just type the command
@@ -773,6 +890,7 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context,
             update.message.message_id,
             subject=subject,
+            **admin_options,
         )
     else:
         await _launch_command(
@@ -780,6 +898,7 @@ async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             context,
             update.message.message_id,
+            **admin_options,
         )
 
 async def password_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
